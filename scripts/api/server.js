@@ -15,6 +15,7 @@ import {
     syncMissingDefaults
 } from './configEditor.js'
 import { readSchedule, writeSchedule } from './scheduleStore.js'
+import { addQueries, readQueries, removeQueries, replaceQueries } from './queryStore.js'
 import { deleteStoredSessions, listStoredSessions } from './sessionStore.js'
 import { resolveRunCommand } from './runCommand.js'
 import {
@@ -114,8 +115,10 @@ const ALLOW_ENV_OVERRIDES = envBool('API_ALLOW_ENV_OVERRIDES', false)
 const REVEAL_ENABLED = envBool('API_ALLOW_CONFIG_REVEAL', false)
 const ALLOW_CONFIG_WRITE = envBool('API_ALLOW_CONFIG_WRITE', false)
 const ALLOW_SCHEDULE_WRITE = envBool('API_ALLOW_SCHEDULE_WRITE', false)
+const ALLOW_QUERY_WRITE = envBool('API_ALLOW_QUERY_WRITE', false)
 
 const RUN_HISTORY = integerSetting('API_RUN_HISTORY', envStr('API_RUN_HISTORY'), 20)
+const QUERY_PAGE_LIMIT = 20000
 const DIAG_DIR = envStr('API_DIAGNOSTICS_DIR') ?? path.join(projectRoot, 'diagnostics')
 
 const { command, args } = resolveRunCommand({ projectRoot })
@@ -354,13 +357,15 @@ const requestHandler = async (req, res) => {
                     'GET /config/diff',
                     'POST /config/sync',
                     'GET /schedule',
+                    'GET /queries',
                     'POST /start',
                     'POST /stop',
                     'POST /restart',
                     'POST /shutdown',
                     'DELETE /sessions/:email',
                     'PUT|PATCH /config',
-                    'PUT|PATCH /schedule'
+                    'PUT|PATCH /schedule',
+                    'PUT|PATCH /queries'
                 ]
             })
         }
@@ -564,6 +569,100 @@ const requestHandler = async (req, res) => {
                     `Schedule updated via API (${method}): ${updated.enabled ? `${updated.cron} (TZ ${updated.timezone})` : 'disabled'}.`
                 )
                 return sendJson(res, 200, { ...updated, writable: true })
+            } catch (err) {
+                const status = err.code === 'BAD_REQUEST' ? 400 : 500
+                return sendJson(res, status, { error: err.message, code: err.code })
+            }
+        }
+
+        // query list read
+        if (method === 'GET' && pathname === '/queries') {
+            try {
+                const result = readQueries(projectRoot)
+                const search = (url.searchParams.get('q') ?? '').trim().toLowerCase()
+                const offset = clampInt(url.searchParams.get('offset'), 0, Number.MAX_SAFE_INTEGER, 0)
+                const limit = url.searchParams.has('limit')
+                    ? clampInt(url.searchParams.get('limit'), 1, QUERY_PAGE_LIMIT, QUERY_PAGE_LIMIT)
+                    : null
+                const matched = search
+                    ? result.queries.filter(query => query.toLowerCase().includes(search))
+                    : result.queries
+                const page = limit === null ? matched.slice(offset) : matched.slice(offset, offset + limit)
+                return sendJson(res, 200, {
+                    ...result,
+                    writable: ALLOW_QUERY_WRITE,
+                    matched: matched.length,
+                    returned: page.length,
+                    offset,
+                    queries: page
+                })
+            } catch (err) {
+                return sendJson(res, err.code === 'QUERY_FILE_MISSING' ? 404 : 500, {
+                    error: err.message,
+                    code: err.code
+                })
+            }
+        }
+
+        // query list replace
+        if (method === 'PUT' && pathname === '/queries') {
+            if (!ALLOW_QUERY_WRITE) {
+                return sendJson(res, 403, {
+                    error: 'Query list writes are disabled. Set API_ALLOW_QUERY_WRITE=true to enable.'
+                })
+            }
+            const body = await readJsonBody(req)
+            const entries = Array.isArray(body) ? body : body?.queries
+            try {
+                const result = replaceQueries(projectRoot, entries)
+                pm.note(
+                    'info',
+                    `search-queries.json replaced via API ${method} /queries (${result.previousCount} -> ${result.count} queries).`
+                )
+                return sendJson(res, 200, { ok: true, ...result, writable: true, appliesImmediately: true })
+            } catch (err) {
+                const status = err.code === 'BAD_REQUEST' ? 400 : 500
+                return sendJson(res, status, { error: err.message, code: err.code })
+            }
+        }
+
+        // query list partial update
+        if (method === 'PATCH' && pathname === '/queries') {
+            if (!ALLOW_QUERY_WRITE) {
+                return sendJson(res, 403, {
+                    error: 'Query list writes are disabled. Set API_ALLOW_QUERY_WRITE=true to enable.'
+                })
+            }
+            const body = await readJsonObject(req)
+            const hasAdd = 'add' in body
+            const hasRemove = 'remove' in body
+            if (!hasAdd && !hasRemove) {
+                return sendJson(res, 400, {
+                    error: 'PATCH /queries requires `add`, `remove`, or both.',
+                    code: 'BAD_REQUEST'
+                })
+            }
+            try {
+                const removal = hasRemove ? removeQueries(projectRoot, body.remove) : null
+                const addition = hasAdd ? addQueries(projectRoot, body.add) : null
+                const updated = readQueries(projectRoot)
+                pm.note(
+                    'info',
+                    `search-queries.json updated via API ${method} /queries (+${addition?.added.length ?? 0} / -${removal?.removed.length ?? 0}); now ${updated.total} queries.`
+                )
+                return sendJson(res, 200, {
+                    ok: true,
+                    path: updated.path,
+                    written: [...new Set([...(removal?.written ?? []), ...(addition?.written ?? [])])],
+                    count: updated.total,
+                    previousCount: removal?.previousCount ?? addition?.previousCount ?? updated.total,
+                    added: addition?.added ?? [],
+                    skipped: addition?.skipped ?? [],
+                    removed: removal?.removed ?? [],
+                    notFound: removal?.notFound ?? [],
+                    writable: true,
+                    appliesImmediately: true
+                })
             } catch (err) {
                 const status = err.code === 'BAD_REQUEST' ? 400 : 500
                 return sendJson(res, status, { error: err.message, code: err.code })
@@ -820,7 +919,7 @@ server.listen(PORT, HOST, () => {
     )
     log(
         'INFO',
-        `Runtime state: memory-only | config writes: ${ALLOW_CONFIG_WRITE ? 'on' : 'off'} | schedule writes: ${ALLOW_SCHEDULE_WRITE ? 'on' : 'off'} | session deletion: account-scoped`
+        `Runtime state: memory-only | config writes: ${ALLOW_CONFIG_WRITE ? 'on' : 'off'} | schedule writes: ${ALLOW_SCHEDULE_WRITE ? 'on' : 'off'} | query-list writes: ${ALLOW_QUERY_WRITE ? 'on' : 'off'} | session deletion: account-scoped`
     )
     if (!TOKEN) {
         const loopback = HOST === '127.0.0.1' || HOST === 'localhost' || HOST === '::1'

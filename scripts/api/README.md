@@ -82,6 +82,10 @@ other scripts in the project.
     - [Reading and editing the schedule](#reading-and-editing-the-schedule)
         - [`GET /schedule`](#get-schedule)
         - [`PUT /schedule` and `PATCH /schedule`](#put-schedule-and-patch-schedule)
+    - [Reading and editing the local query list](#reading-and-editing-the-local-query-list)
+        - [`GET /queries`](#get-queries)
+        - [`PUT /queries`](#put-queries)
+        - [`PATCH /queries`](#patch-queries)
     - [Axios response and error handling](#axios-response-and-error-handling)
     - [PowerShell examples](#powershell-examples)
     - [HTTP status codes](#http-status-codes)
@@ -423,6 +427,7 @@ server itself remains dependency-free.
 | `GET`  | `/diagnostics/<capture>/<file>` | Download or view one diagnostic artifact.                         |
 | `GET`  | `/config`                       | Read `config.json`, redacted by default.                          |
 | `GET`  | `/schedule`                     | Read the effective cron schedule and its source.                  |
+| `GET`  | `/queries`                      | Read the bundled local search query list.                         |
 | `GET`  | `/events`                       | SSE stream containing live logs and status updates.               |
 
 ### Control and write endpoints
@@ -438,6 +443,8 @@ server itself remains dependency-free.
 | `PATCH`  | `/config`          | Deep-merge a partial config after validation.           |
 | `PUT`    | `/schedule`        | Persist and immediately apply supplied schedule fields. |
 | `PATCH`  | `/schedule`        | Persist and immediately apply supplied schedule fields. |
+| `PUT`    | `/queries`         | Replace the local search query list.                    |
+| `PATCH`  | `/queries`         | Append and/or remove local search queries.              |
 
 ## Reading API state
 
@@ -1890,6 +1897,202 @@ disabled, both methods return `403 Forbidden`. Outside the supplied Docker
 image, a write can return `500` if the cron template or `crontab` executable is
 not available.
 
+## Reading and editing the local query list
+
+The `local` query engine searches the bundled `src/functions/search-queries.json`,
+a JSON array of plain search strings. `npm run build` copies that file to
+`dist/functions/search-queries.json`, which is what the compiled bot reads.
+
+The bot re-reads the file every time it builds or refills its topic pool, so an
+edit applies to the next pool build. Restarting an active run is not required.
+Reading is always available; writing must be explicitly enabled.
+
+Both copies are kept in sync: reads prefer `src`, and writes are mirrored to an
+existing `dist` copy so a bot running from `dist` picks the change up immediately.
+
+[`queries-api.md`](./queries-api.md) is a condensed, code-generation friendly
+reference for these three endpoints: TypeScript definitions, validation rules,
+and the complete status-code matrix.
+
+### `GET /queries`
+
+Returns the current query list and whether this API instance permits changes.
+
+Optional query parameters:
+
+| Parameter | Description                                                           |
+| --------- | --------------------------------------------------------------------- |
+| `q`       | Case-insensitive substring filter.                                    |
+| `limit`   | Maximum number of queries returned, from 1 to 20000. Defaults to all. |
+| `offset`  | Number of matching queries to skip. Defaults to `0`.                  |
+
+**cURL**
+
+```bash
+curl --request GET \
+  --url 'http://127.0.0.1:3010/queries?q=coffee&limit=2' \
+  --header 'Authorization: Bearer YOUR_API_TOKEN'
+```
+
+**Axios**
+
+```js
+const { data } = await api.get('/queries', { params: { q: 'coffee', limit: 2 } })
+console.log(data)
+```
+
+```json
+{
+    "path": "/opt/microsoft-rewards-script/src/functions/search-queries.json",
+    "mirrors": [
+        {
+            "path": "/opt/microsoft-rewards-script/dist/functions/search-queries.json",
+            "inSync": true
+        }
+    ],
+    "writable": false,
+    "total": 7000,
+    "uniqueCount": 7000,
+    "duplicates": [],
+    "matched": 30,
+    "returned": 2,
+    "offset": 0,
+    "queries": ["coffee vs espresso difference", "how to make coffee at home"]
+}
+```
+
+Fields:
+
+- `path`: the file that was read. The `src` copy is preferred and `dist` is used
+  only when no source copy exists;
+- `mirrors`: other existing copies of the same list, each with an `inSync` flag
+  comparing its contents with the file that was read;
+- `writable`: whether `API_ALLOW_QUERY_WRITE=true` is active;
+- `total`: entries in the file, including duplicates;
+- `uniqueCount`: distinct queries after trimming and case-folding;
+- `duplicates`: normalized queries that appear more than once;
+- `matched`: queries left after the `q` filter;
+- `returned`: queries in this response after `offset` and `limit`;
+- `queries`: the returned queries.
+
+A missing file returns `404` and an unparseable or non-string-array file returns
+`500` with `code: "CORRUPT_QUERY_LIST"`.
+
+### `PUT /queries`
+
+Enable query list writes in the API process first:
+
+```dotenv
+API_ALLOW_QUERY_WRITE=true
+```
+
+The body is either an object with a `queries` array or a bare JSON array. Entries
+are trimmed, internal whitespace is collapsed, duplicates are dropped so the
+first occurrence wins, and the result replaces the whole list. Existing files are
+backed up as `search-queries.json.bak` and written atomically.
+
+**cURL**
+
+```bash
+curl --request PUT \
+  --url http://127.0.0.1:3010/queries \
+  --header 'Authorization: Bearer YOUR_API_TOKEN' \
+  --header 'Content-Type: application/json' \
+  --data '{"queries":["best budget smartphones","coffee vs espresso difference","how to fix slow computer"]}'
+```
+
+**Axios**
+
+```js
+const { data } = await api.put('/queries', {
+    queries: ['best budget smartphones', 'coffee vs espresso difference', 'how to fix slow computer']
+})
+
+console.log(data)
+```
+
+```json
+{
+    "ok": true,
+    "path": "/opt/microsoft-rewards-script/src/functions/search-queries.json",
+    "written": [
+        "/opt/microsoft-rewards-script/src/functions/search-queries.json",
+        "/opt/microsoft-rewards-script/dist/functions/search-queries.json"
+    ],
+    "count": 3,
+    "previousCount": 7000,
+    "duplicatesRemoved": 0,
+    "duplicates": [],
+    "writable": true,
+    "appliesImmediately": true
+}
+```
+
+An empty list, blank entries, entries longer than 200 characters, control
+characters, or more than 20000 entries return `400 Bad Request`.
+
+### `PATCH /queries`
+
+Partial update. The body must contain `add`, `remove`, or both:
+
+| Field    | Type     | Description                                                                        |
+| -------- | -------- | ---------------------------------------------------------------------------------- |
+| `add`    | string[] | Queries appended to the list. Entries already present are reported as `skipped`.   |
+| `remove` | string[] | Queries deleted from the list. Entries that are absent are reported as `notFound`. |
+
+`remove` is applied before `add`, so a rename can be expressed in one request.
+Matching is trimmed and case-insensitive, accepting `"Cook  Rice"` as
+`"cook rice"`. Removing every entry is rejected, because an empty list leaves the
+`local` query engine without topics; use `PUT /queries` to replace the list
+deliberately.
+
+**cURL**
+
+```bash
+curl --request PATCH \
+  --url http://127.0.0.1:3010/queries \
+  --header 'Authorization: Bearer YOUR_API_TOKEN' \
+  --header 'Content-Type: application/json' \
+  --data '{"add":["how to brew pour over coffee"],"remove":["coffee vs espresso difference"]}'
+```
+
+**Axios**
+
+```js
+const { data } = await api.patch('/queries', {
+    add: ['how to brew pour over coffee'],
+    remove: ['coffee vs espresso difference']
+})
+
+console.log(data)
+```
+
+```json
+{
+    "ok": true,
+    "path": "/opt/microsoft-rewards-script/src/functions/search-queries.json",
+    "written": [
+        "/opt/microsoft-rewards-script/src/functions/search-queries.json",
+        "/opt/microsoft-rewards-script/dist/functions/search-queries.json"
+    ],
+    "count": 7000,
+    "previousCount": 7000,
+    "added": ["how to brew pour over coffee"],
+    "skipped": [],
+    "removed": ["coffee vs espresso difference"],
+    "notFound": [],
+    "writable": true,
+    "appliesImmediately": true
+}
+```
+
+Adding a query that already exists is not an error; the response reports it under
+`skipped`. Removing a query that does not exist is not an error either; the
+response reports it under `notFound`. A body that is not a JSON object, or an
+object without `add` and `remove`, returns `400 Bad Request`.
+
+When writes are disabled, both write methods return `403 Forbidden`.
+
 ## Axios response and error handling
 
 Axios places a successful JSON response in `response.data`:
@@ -2014,6 +2217,7 @@ All variables are optional.
 | `API_RUN_ARGS`             | none                          | Default arguments for `API_RUN_COMMAND`; accepts whitespace-separated text or a JSON array. |
 | `API_DIAGNOSTICS_DIR`      | `<repo>/diagnostics`          | Read-only diagnostics directory.                                                            |
 | `API_ALLOW_CONFIG_WRITE`   | `false`                       | Permit `PUT` and `PATCH /config`.                                                           |
+| `API_ALLOW_QUERY_WRITE`    | `false`                       | Permit `PUT` and `PATCH /queries`.                                                          |
 | `API_ALLOW_SCHEDULE_WRITE` | `false`                       | Permit `PUT` and `PATCH /schedule`.                                                         |
 | `API_ALLOW_ENV_OVERRIDES`  | `false`                       | Permit arbitrary `env` fields in `/start` and `/restart`.                                   |
 | `API_ALLOW_CONFIG_REVEAL`  | `false`                       | Permit authenticated `GET /config?reveal=1`.                                                |
@@ -2067,8 +2271,8 @@ Treat it as an administrative API.
   leave the machine.
 - Restrict `API_CORS_ORIGIN` to the actual dashboard origin instead of `*` when
   a browser accesses the API directly.
-- Leave config writes, schedule writes, config reveal, and arbitrary environment
-  overrides disabled unless they are required.
+- Leave config writes, schedule writes, query list writes, config reveal, and
+  arbitrary environment overrides disabled unless they are required.
 - Avoid putting the API token in URLs except where browser SSE requires it.
 - Do not expose the port directly to the public internet.
 
@@ -2115,6 +2319,7 @@ services:
             API_TOKEN: '${API_TOKEN}'
             API_ALLOW_SCHEDULE_WRITE: 'true' # optional
             API_ALLOW_CONFIG_WRITE: 'true' # optional
+            API_ALLOW_QUERY_WRITE: 'true' # optional
         ports:
             - '3010:3010'
 ```
@@ -2154,6 +2359,8 @@ starting a second unusable instance.
 | `accounts.js`       | Safe account summaries and child-only account selection/remapping.                    |
 | `configEditor.js`   | Config loading, validation, deep merge, backup, and atomic replacement.               |
 | `scheduleStore.js`  | Schedule validation, persistence, reads, and live crontab application.                |
+| `queryStore.js`     | Local search query list reads, validation, deduplication, and atomic mirrored writes. |
+| `queries-api.md`    | Code-generation reference for the `/queries` endpoints.                               |
 | `sessionStore.js`   | Safe session metadata reads and account-specific SQLite session deletion.             |
 | `apply-schedule.js` | Restores a persisted schedule override during Docker startup.                         |
 | `trigger.js`        | Routes Docker cron and `RUN_ON_START` executions through the local API.               |
