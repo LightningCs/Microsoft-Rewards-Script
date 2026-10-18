@@ -36,9 +36,11 @@ ENV NODE_ENV=production \
     FORCE_HEADLESS=1 \
     NODE_OPTIONS=--disable-warning=ExperimentalWarning
 
-# Install minimal system libraries required for Chromium headless to run,
-# plus jq (for config generation/patching) and gettext-base (for envsubst)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 在 apt-get update 前配置 apt 专用代理
+RUN echo 'Acquire::http::Proxy "'"${HTTP_PROXY}"'";' > /etc/apt/apt.conf.d/90proxy && \
+    echo 'Acquire::https::Proxy "'"${HTTP_PROXY}"'";' >> /etc/apt/apt.conf.d/90proxy && \
+    echo 'Acquire::Retries "5";' >> /etc/apt/apt.conf.d/90proxy && \
+    apt-get update && apt-get install -y --no-install-recommends \
     cron \
     gettext-base \
     jq \
@@ -76,6 +78,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-color-emoji \
     fonts-freefont-ttf \
     fonts-droid-fallback \
+    && rm -f /etc/apt/apt.conf.d/90proxy \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Copy compiled application and dependencies from builder stage
