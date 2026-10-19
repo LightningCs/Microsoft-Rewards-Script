@@ -1,76 +1,43 @@
-###############################################################################
-# Base Image: 系统依赖 + Chromium headless shell
-# 只在 Debian 源或 patchright/浏览器版本需要升级时重建
-###############################################################################
+# Dockerfile.base
 FROM node:24-slim
 
-# 生产环境变量（与应用层共享）
-ENV NODE_ENV=production \
+# 原始脚本中的环境变量，保持不变
+ENV PLAYWRIGHT_BROWSERS_PATH=0 \
+    NODE_ENV=production \
     TZ=UTC \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
     FORCE_HEADLESS=1 \
     NODE_OPTIONS=--disable-warning=ExperimentalWarning
 
-# 换阿里云源 + 安装 Chromium 运行所需的系统库
-RUN set -eux; \
-    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
-        sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; \
-    fi; \
-    if [ -f /etc/apt/sources.list ]; then \
-        sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list; \
-    fi; \
+# 为 apt 配置代理并增加重试
+RUN echo 'Acquire::http::Proxy "http://172.17.112.1:10090";' > /etc/apt/apt.conf.d/90proxy && \
+    echo 'Acquire::https::Proxy "http://172.17.112.1:10090";' >> /etc/apt/apt.conf.d/90proxy && \
+    echo 'Acquire::Retries "5";' >> /etc/apt/apt.conf.d/90proxy && \
+    echo 'Acquire::http::Timeout "30";' >> /etc/apt/apt.conf.d/90proxy && \
+    echo 'Acquire::https::Timeout "30";' >> /etc/apt/apt.conf.d/90proxy && \
     apt-get update && apt-get install -y --no-install-recommends \
-    cron \
-    gettext-base \
-    jq \
-    tzdata \
-    ca-certificates \
-    libglib2.0-0 \
-    libdbus-1-3 \
-    libexpat1 \
-    libfontconfig1 \
-    libgtk-3-0 \
-    libnspr4 \
-    libnss3 \
-    libasound2 \
-    libflac12 \
-    libatk1.0-0 \
-    libatspi2.0-0 \
-    libdrm2 \
-    libgbm1 \
-    libdav1d6 \
-    libx11-6 \
-    libx11-xcb1 \
-    libxcomposite1 \
-    libxcursor1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxi6 \
-    libxrandr2 \
-    libxrender1 \
-    libxss1 \
-    libxtst6 \
-    libdouble-conversion3 \
-    fonts-liberation \
-    fonts-noto-core \
-    fonts-noto-color-emoji \
-    fonts-freefont-ttf \
-    fonts-droid-fallback \
+    cron gettext-base jq tzdata ca-certificates \
+    libglib2.0-0 libdbus-1-3 libexpat1 libfontconfig1 libgtk-3-0 \
+    libnspr4 libnss3 libasound2 libflac12 libatk1.0-0 libatspi2.0-0 \
+    libdrm2 libgbm1 libdav1d6 libx11-6 libx11-xcb1 libxcomposite1 \
+    libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 \
+    libxrender1 libxss1 libxtst6 libdouble-conversion3 \
+    fonts-liberation fonts-noto-core fonts-noto-color-emoji \
+    fonts-freefont-ttf fonts-droid-fallback \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# 下载 Chromium headless shell 到 $PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
-# 用一个临时项目调用 patchright 的 install 命令，装完就删
-# PATCHRIGHT_VERSION 需与应用 package.json 中的版本保持一致
-ARG PATCHRIGHT_VERSION=latest
-WORKDIR /opt/patchright-installer
-RUN set -eux; \
-    npm init -y; \
-    npm install --no-audit --no-fund patchright@${PATCHRIGHT_VERSION}; \
-    npx patchright install --only-shell chromium; \
-    cd /; \
-    rm -rf /opt/patchright-installer; \
-    ls -la /opt/ms-playwright
+# 2. 设置工作目录，并安装运行时依赖 (原始脚本的 npm ci --omit=dev 部分)
+WORKDIR /usr/src/microsoft-rewards-script
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts
+
+# 3. 安装浏览器到 node_modules 内部 (原始脚本的 patchright install 部分)
+#    这是基础镜像构建中最耗时的一步，但只会发生一次
+ENV PLAYWRIGHT_DOWNLOAD_HOST=https://npmmirror.com/mirrors/playwright
+RUN npx patchright install --only-shell chromium
+
+# 可选：清理，减小镜像体积
+RUN npm cache clean --force && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # 执行以下命令来构建基础镜像
 # docker build -f Dockerfile.base \
