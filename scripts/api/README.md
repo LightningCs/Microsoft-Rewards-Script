@@ -82,10 +82,11 @@ other scripts in the project.
     - [Reading and editing the schedule](#reading-and-editing-the-schedule)
         - [`GET /schedule`](#get-schedule)
         - [`PUT /schedule` and `PATCH /schedule`](#put-schedule-and-patch-schedule)
-    - [Reading and editing the local query list](#reading-and-editing-the-local-query-list)
-        - [`GET /queries`](#get-queries)
-        - [`PUT /queries`](#put-queries)
-        - [`PATCH /queries`](#patch-queries)
+    - [Refreshing the hot board](#refreshing-the-hot-board)
+        - [`GET /hotboard`](#get-hotboard)
+        - [`POST /hotboard/refresh`](#post-hotboardrefresh)
+        - [`GET /hotboard/schedule` and `PUT|PATCH /hotboard/schedule`](#get-hotboardschedule-and-putpatch-hotboardschedule)
+        - [`GET /hotboard/source` and `PUT|PATCH /hotboard/source`](#get-hotboardsource-and-putpatch-hotboardsource)
     - [Axios response and error handling](#axios-response-and-error-handling)
     - [PowerShell examples](#powershell-examples)
     - [HTTP status codes](#http-status-codes)
@@ -427,24 +428,29 @@ server itself remains dependency-free.
 | `GET`  | `/diagnostics/<capture>/<file>` | Download or view one diagnostic artifact.                         |
 | `GET`  | `/config`                       | Read `config.json`, redacted by default.                          |
 | `GET`  | `/schedule`                     | Read the effective cron schedule and its source.                  |
-| `GET`  | `/queries`                      | Read the bundled local search query list.                         |
+| `GET`  | `/hotboard`                     | Read the hot board configuration, state, and last refresh.        |
+| `GET`  | `/hotboard/schedule`            | Read the hot board refresh cron expression.                       |
+| `GET`  | `/hotboard/source`              | Read the hot board provider URL, board type, and title limit.     |
 | `GET`  | `/events`                       | SSE stream containing live logs and status updates.               |
 
 ### Control and write endpoints
 
-| Method   | Path               | Purpose                                                 |
-| -------- | ------------------ | ------------------------------------------------------- |
-| `POST`   | `/start`           | Start a bot run.                                        |
-| `POST`   | `/stop`            | Request graceful or forced process termination.         |
-| `POST`   | `/restart`         | Stop an active run, then start a new one.               |
-| `POST`   | `/shutdown`        | Stop the bot if needed and terminate the API process.   |
-| `DELETE` | `/sessions/:email` | Delete only one account's mobile and desktop sessions.  |
-| `PUT`    | `/config`          | Replace the complete config after validation.           |
-| `PATCH`  | `/config`          | Deep-merge a partial config after validation.           |
-| `PUT`    | `/schedule`        | Persist and immediately apply supplied schedule fields. |
-| `PATCH`  | `/schedule`        | Persist and immediately apply supplied schedule fields. |
-| `PUT`    | `/queries`         | Replace the local search query list.                    |
-| `PATCH`  | `/queries`         | Append and/or remove local search queries.              |
+| Method   | Path                 | Purpose                                                  |
+| -------- | -------------------- | -------------------------------------------------------- |
+| `POST`   | `/start`             | Start a bot run.                                         |
+| `POST`   | `/stop`              | Request graceful or forced process termination.          |
+| `POST`   | `/restart`           | Stop an active run, then start a new one.                |
+| `POST`   | `/shutdown`          | Stop the bot if needed and terminate the API process.    |
+| `DELETE` | `/sessions/:email`   | Delete only one account's mobile and desktop sessions.   |
+| `PUT`    | `/config`            | Replace the complete config after validation.            |
+| `PATCH`  | `/config`            | Deep-merge a partial config after validation.            |
+| `PUT`    | `/schedule`          | Persist and immediately apply supplied schedule fields.  |
+| `PATCH`  | `/schedule`          | Persist and immediately apply supplied schedule fields.  |
+| `POST`   | `/hotboard/refresh`  | Fetch the provider now and rewrite the local query list. |
+| `PUT`    | `/hotboard/schedule` | Persist the hot board cron expression.                   |
+| `PATCH`  | `/hotboard/schedule` | Persist the hot board cron expression.                   |
+| `PUT`    | `/hotboard/source`   | Persist the hot board provider settings.                 |
+| `PATCH`  | `/hotboard/source`   | Persist the hot board provider settings.                 |
 
 ## Reading API state
 
@@ -487,13 +493,19 @@ console.log(data)
         "GET /events",
         "GET /config",
         "GET /schedule",
+        "GET /hotboard",
+        "GET /hotboard/schedule",
+        "GET /hotboard/source",
+        "POST /hotboard/refresh",
         "POST /start",
         "POST /stop",
         "POST /restart",
         "POST /shutdown",
         "DELETE /sessions/:email",
         "PUT|PATCH /config",
-        "PUT|PATCH /schedule"
+        "PUT|PATCH /schedule",
+        "PUT|PATCH /hotboard/schedule",
+        "PUT|PATCH /hotboard/source"
     ]
 }
 ```
@@ -1897,201 +1909,299 @@ disabled, both methods return `403 Forbidden`. Outside the supplied Docker
 image, a write can return `500` if the cron template or `crontab` executable is
 not available.
 
-## Reading and editing the local query list
+## Refreshing the hot board
 
-The `local` query engine searches the bundled `src/functions/search-queries.json`,
-a JSON array of plain search strings. `npm run build` copies that file to
-`dist/functions/search-queries.json`, which is what the compiled bot reads.
+The `local` query engine reads a hot board list that this API refreshes from an
+external provider. Each refresh takes the `list[].title` values from the provider
+response and writes them to `search-queries.json`:
 
-The bot re-reads the file every time it builds or refills its topic pool, so an
-edit applies to the next pool build. Restarting an active run is not required.
-Reading is always available; writing must be explicitly enabled.
+- `src/functions/search-queries.json` — the live list, replaced by every
+  successful refresh;
+- `dist/functions/search-queries.json` — mirrored so a bot running from `dist`
+  picks the change up immediately;
+- `src/functions/search-queries.bundled.json` — the shipped query list, used as a
+  fallback whenever the live list is missing or empty.
 
-Both copies are kept in sync: reads prefer `src`, and writes are mirrored to an
-existing `dist` copy so a bot running from `dist` picks the change up immediately.
+The bot re-reads the file every time it builds or refills its topic pool, so a
+refresh hot-loads into a running bot. No restart and no config change are needed.
 
-[`queries-api.md`](./queries-api.md) is a condensed, code-generation friendly
-reference for these three endpoints: TypeScript definitions, validation rules,
-and the complete status-code matrix.
+Refreshes run on their own cron schedule inside this API process, so the
+scheduler is active only while the control API runs. Configuration is stored in
+`config/hotboard.json`, which is created on the first write; without that file
+the defaults come from the `HOTBOARD_*` environment variables.
 
-### `GET /queries`
+A failed refresh never modifies the live list: the previous contents stay in
+place, the error is stored with the last run, and the next scheduled or manual
+attempt retries. `POST /hotboard/refresh` exists exactly for that case.
 
-Returns the current query list and whether this API instance permits changes.
+[`hotboard-api.md`](./hotboard-api.md) is a condensed, code-generation friendly
+reference for these endpoints: TypeScript definitions, validation rules, and the
+complete status-code matrix.
 
-Optional query parameters:
+### `GET /hotboard`
 
-| Parameter | Description                                                           |
-| --------- | --------------------------------------------------------------------- |
-| `q`       | Case-insensitive substring filter.                                    |
-| `limit`   | Maximum number of queries returned, from 1 to 20000. Defaults to all. |
-| `offset`  | Number of matching queries to skip. Defaults to `0`.                  |
+Returns the stored configuration, the query file state, and the most recent
+refresh result. Reading is always available.
 
 **cURL**
 
 ```bash
 curl --request GET \
-  --url 'http://127.0.0.1:3010/queries?q=coffee&limit=2' \
+  --url http://127.0.0.1:3010/hotboard \
   --header 'Authorization: Bearer YOUR_API_TOKEN'
 ```
 
 **Axios**
 
 ```js
-const { data } = await api.get('/queries', { params: { q: 'coffee', limit: 2 } })
+const { data } = await api.get('/hotboard')
 console.log(data)
 ```
 
 ```json
 {
-    "path": "/opt/microsoft-rewards-script/src/functions/search-queries.json",
-    "mirrors": [
-        {
-            "path": "/opt/microsoft-rewards-script/dist/functions/search-queries.json",
-            "inSync": true
-        }
-    ],
+    "enabled": true,
+    "cron": "0 6 * * *",
+    "source": "https://uapis.cn/api/v1/misc/hotboard",
+    "type": "baidu",
+    "limit": 0,
+    "timezone": "Europe/Amsterdam",
+    "updatedAt": "2026-10-19T04:00:02.000Z",
+    "origin": "override",
+    "path": "/opt/microsoft-rewards-script/config/hotboard.json",
+    "nextRunAt": "2026-10-20T04:00:00.000Z",
     "writable": false,
-    "total": 7000,
-    "uniqueCount": 7000,
-    "duplicates": [],
-    "matched": 30,
-    "returned": 2,
-    "offset": 0,
-    "queries": ["coffee vs espresso difference", "how to make coffee at home"]
+    "queryFile": {
+        "path": "/opt/microsoft-rewards-script/src/functions/search-queries.json",
+        "count": 50,
+        "updatedAt": "2026-10-19T04:00:02.512Z"
+    },
+    "supportedTypes": ["baidu", "weibo", "zhihu", "douyin", "bilibili", "toutiao"],
+    "limits": { "maxLimit": 500, "maxTitlesInState": 100 },
+    "lastRun": {
+        "at": "2026-10-19T04:00:02.400Z",
+        "ok": true,
+        "trigger": "schedule",
+        "httpStatus": 200,
+        "durationMs": 431,
+        "count": 50,
+        "written": 2,
+        "upstreamUpdateTime": "2026-10-19T03:58:00.000Z",
+        "error": null,
+        "titles": ["第一条热搜标题", "第二条热搜标题"]
+    }
 }
 ```
 
 Fields:
 
-- `path`: the file that was read. The `src` copy is preferred and `dist` is used
-  only when no source copy exists;
-- `mirrors`: other existing copies of the same list, each with an `inSync` flag
-  comparing its contents with the file that was read;
-- `writable`: whether `API_ALLOW_QUERY_WRITE=true` is active;
-- `total`: entries in the file, including duplicates;
-- `uniqueCount`: distinct queries after trimming and case-folding;
-- `duplicates`: normalized queries that appear more than once;
-- `matched`: queries left after the `q` filter;
-- `returned`: queries in this response after `offset` and `limit`;
-- `queries`: the returned queries.
+- `enabled` / `cron` / `timezone`: the daily refresh schedule, evaluated in `TZ`;
+- `source` / `type` / `limit`: the provider URL, the `type` query parameter sent
+  with it, and the maximum number of titles kept (`0` keeps every title);
+- `origin`: `env` when the values still come from `HOTBOARD_*`, `override` after
+  `config/hotboard.json` has been written;
+- `nextRunAt`: the next scheduled refresh within the coming seven days, or `null`
+  when nothing matches in that window;
+- `writable`: whether `API_ALLOW_HOTBOARD_WRITE=true` is active;
+- `queryFile`: the live list currently read by the bot, with its entry count;
+- `supportedTypes`: known provider boards, offered as dropdown suggestions;
+- `lastRun`: `trigger` is `schedule`, `manual`, or `startup`; `count` is the
+  number of titles fetched, `written` the number of files written; `titles` keeps
+  a sample of the last result.
 
-A missing file returns `404` and an unparseable or non-string-array file returns
-`500` with `code: "CORRUPT_QUERY_LIST"`.
+### `POST /hotboard/refresh`
 
-### `PUT /queries`
+Fetches the provider right now and writes the titles to the live list. This is the
+recovery path when a scheduled refresh failed.
 
-Enable query list writes in the API process first:
+Enable hot board writes in the API process first:
 
 ```dotenv
-API_ALLOW_QUERY_WRITE=true
+API_ALLOW_HOTBOARD_WRITE=true
 ```
 
-The body is either an object with a `queries` array or a bare JSON array. Entries
-are trimmed, internal whitespace is collapsed, duplicates are dropped so the
-first occurrence wins, and the result replaces the whole list. Existing files are
-backed up as `search-queries.json.bak` and written atomically.
-
-**cURL**
+A dry run fetches and reports the result without touching the query list or the
+stored state. It is allowed even when writes are disabled, which makes it the
+cheapest way to check connectivity and the provider response:
 
 ```bash
-curl --request PUT \
-  --url http://127.0.0.1:3010/queries \
+curl --request POST \
+  --url http://127.0.0.1:3010/hotboard/refresh \
   --header 'Authorization: Bearer YOUR_API_TOKEN' \
   --header 'Content-Type: application/json' \
-  --data '{"queries":["best budget smartphones","coffee vs espresso difference","how to fix slow computer"]}'
+  --data '{"dryRun":true}'
+```
+
+A real refresh:
+
+```bash
+curl --request POST \
+  --url http://127.0.0.1:3010/hotboard/refresh \
+  --header 'Authorization: Bearer YOUR_API_TOKEN' \
+  --header 'Content-Type: application/json' \
+  --data '{}'
 ```
 
 **Axios**
 
 ```js
-const { data } = await api.put('/queries', {
-    queries: ['best budget smartphones', 'coffee vs espresso difference', 'how to fix slow computer']
-})
-
-console.log(data)
+const { data } = await api.post('/hotboard/refresh', {})
+console.log(data.ok, data.count, data.written)
 ```
 
 ```json
 {
     "ok": true,
-    "path": "/opt/microsoft-rewards-script/src/functions/search-queries.json",
+    "error": null,
+    "httpStatus": 200,
+    "durationMs": 431,
+    "dryRun": false,
+    "count": 50,
+    "upstreamUpdateTime": "2026-10-19T03:58:00.000Z",
     "written": [
         "/opt/microsoft-rewards-script/src/functions/search-queries.json",
         "/opt/microsoft-rewards-script/dist/functions/search-queries.json"
     ],
-    "count": 3,
-    "previousCount": 7000,
-    "duplicatesRemoved": 0,
-    "duplicates": [],
-    "writable": true,
-    "appliesImmediately": true
+    "lastRun": {
+        "at": "2026-10-19T04:00:02.400Z",
+        "ok": true,
+        "trigger": "manual",
+        "httpStatus": 200,
+        "durationMs": 431,
+        "count": 50,
+        "written": 2,
+        "upstreamUpdateTime": "2026-10-19T03:58:00.000Z",
+        "error": null,
+        "titles": ["第一条热搜标题", "第二条热搜标题"]
+    }
 }
 ```
 
-An empty list, blank entries, entries longer than 200 characters, control
-characters, or more than 20000 entries return `400 Bad Request`.
+A provider failure returns `502 Bad Gateway` with the same body shape and
+`ok: false`, plus a readable `error`, for example:
 
-### `PATCH /queries`
+```json
+{
+    "ok": false,
+    "error": "Upstream responded 400: type is invalid",
+    "httpStatus": 400,
+    "durationMs": 212,
+    "dryRun": false,
+    "count": 0,
+    "upstreamUpdateTime": null,
+    "written": [],
+    "lastRun": {
+        "at": "2026-10-19T04:05:00.000Z",
+        "ok": false,
+        "trigger": "manual",
+        "httpStatus": 400,
+        "durationMs": 212,
+        "count": 0,
+        "written": 0,
+        "upstreamUpdateTime": null,
+        "error": "Upstream responded 400: type is invalid",
+        "titles": []
+    }
+}
+```
 
-Partial update. The body must contain `add`, `remove`, or both:
+The live list is untouched by a failed refresh, so the dashboard can show the
+error and offer the button again.
 
-| Field    | Type     | Description                                                                        |
-| -------- | -------- | ---------------------------------------------------------------------------------- |
-| `add`    | string[] | Queries appended to the list. Entries already present are reported as `skipped`.   |
-| `remove` | string[] | Queries deleted from the list. Entries that are absent are reported as `notFound`. |
+### `GET /hotboard/schedule` and `PUT|PATCH /hotboard/schedule`
 
-`remove` is applied before `add`, so a rename can be expressed in one request.
-Matching is trimmed and case-insensitive, accepting `"Cook  Rice"` as
-`"cook rice"`. Removing every entry is rejected, because an empty list leaves the
-`local` query engine without topics; use `PUT /queries` to replace the list
-deliberately.
+Read and change the daily refresh cron expression. The schedule is evaluated in
+the container `TZ` and takes effect immediately; no restart is required.
 
 **cURL**
+
+```bash
+curl --request GET \
+  --url http://127.0.0.1:3010/hotboard/schedule \
+  --header 'Authorization: Bearer YOUR_API_TOKEN'
+```
+
+```json
+{
+    "enabled": true,
+    "cron": "0 6 * * *",
+    "timezone": "Europe/Amsterdam",
+    "nextRunAt": "2026-10-20T04:00:00.000Z",
+    "origin": "override",
+    "updatedAt": "2026-10-19T04:00:02.000Z",
+    "writable": true
+}
+```
 
 ```bash
 curl --request PATCH \
-  --url http://127.0.0.1:3010/queries \
+  --url http://127.0.0.1:3010/hotboard/schedule \
   --header 'Authorization: Bearer YOUR_API_TOKEN' \
   --header 'Content-Type: application/json' \
-  --data '{"add":["how to brew pour over coffee"],"remove":["coffee vs espresso difference"]}'
+  --data '{"enabled":true,"cron":"30 7 * * *"}'
 ```
 
-**Axios**
+Supported body fields:
 
-```js
-const { data } = await api.patch('/queries', {
-    add: ['how to brew pour over coffee'],
-    remove: ['coffee vs espresso difference']
-})
+| Field     | Type    | Description                                                      |
+| --------- | ------- | ---------------------------------------------------------------- |
+| `enabled` | boolean | Turn the scheduled refresh on or off.                            |
+| `cron`    | string  | Five-field cron expression; evaluated in the container timezone. |
 
-console.log(data)
+`PUT` and `PATCH` behave identically: only the fields in the body change. The cron
+parser accepts `*`, numeric values, comma lists, ranges, and steps within the
+normal five-field ranges; named months/weekdays and macros such as `@daily` are
+not accepted. When the day-of-month and day-of-week fields are both restricted,
+both must match.
+
+Disabling the schedule keeps the current query list and the manual
+`POST /hotboard/refresh` endpoint working.
+
+### `GET /hotboard/source` and `PUT|PATCH /hotboard/source`
+
+Read and change the provider. The request is `source` + `?type=<type>`.
+
+```bash
+curl --request GET \
+  --url http://127.0.0.1:3010/hotboard/source \
+  --header 'Authorization: Bearer YOUR_API_TOKEN'
 ```
 
 ```json
 {
-    "ok": true,
-    "path": "/opt/microsoft-rewards-script/src/functions/search-queries.json",
-    "written": [
-        "/opt/microsoft-rewards-script/src/functions/search-queries.json",
-        "/opt/microsoft-rewards-script/dist/functions/search-queries.json"
-    ],
-    "count": 7000,
-    "previousCount": 7000,
-    "added": ["how to brew pour over coffee"],
-    "skipped": [],
-    "removed": ["coffee vs espresso difference"],
-    "notFound": [],
-    "writable": true,
-    "appliesImmediately": true
+    "source": "https://uapis.cn/api/v1/misc/hotboard",
+    "type": "baidu",
+    "limit": 0,
+    "supportedTypes": ["baidu", "weibo", "zhihu", "douyin", "bilibili", "toutiao"],
+    "origin": "override",
+    "updatedAt": "2026-10-19T04:00:02.000Z",
+    "writable": true
 }
 ```
 
-Adding a query that already exists is not an error; the response reports it under
-`skipped`. Removing a query that does not exist is not an error either; the
-response reports it under `notFound`. A body that is not a JSON object, or an
-object without `add` and `remove`, returns `400 Bad Request`.
+```bash
+curl --request PATCH \
+  --url http://127.0.0.1:3010/hotboard/source \
+  --header 'Authorization: Bearer YOUR_API_TOKEN' \
+  --header 'Content-Type: application/json' \
+  --data '{"source":"https://uapis.cn/api/v1/misc/hotboard","type":"weibo","limit":30}'
+```
 
-When writes are disabled, both write methods return `403 Forbidden`.
+Supported body fields:
+
+| Field    | Type    | Description                                                                      |
+| -------- | ------- | -------------------------------------------------------------------------------- |
+| `source` | string  | Absolute `http(s)` URL of the provider endpoint.                                 |
+| `type`   | string  | Board identifier sent as `?type=`, up to 32 characters (`[a-z0-9_-]`).           |
+| `limit`  | integer | Titles kept per refresh, `0`..`500`. `0` keeps every title the provider returns. |
+
+`supportedTypes` lists the boards the dashboard may offer as suggestions; any
+other identifier is accepted so a different provider can be plugged in.
+
+When writes are disabled, `PUT` and `PATCH` return `403 Forbidden`. Invalid
+values return `400 Bad Request`, an unreadable `config/hotboard.json` returns
+`500` with `code: "CORRUPT_HOTBOARD"`, and `PUT`/`PATCH` bodies with unexpected
+fields are rejected.
 
 ## Axios response and error handling
 
@@ -2217,14 +2327,19 @@ All variables are optional.
 | `API_RUN_ARGS`             | none                          | Default arguments for `API_RUN_COMMAND`; accepts whitespace-separated text or a JSON array. |
 | `API_DIAGNOSTICS_DIR`      | `<repo>/diagnostics`          | Read-only diagnostics directory.                                                            |
 | `API_ALLOW_CONFIG_WRITE`   | `false`                       | Permit `PUT` and `PATCH /config`.                                                           |
-| `API_ALLOW_QUERY_WRITE`    | `false`                       | Permit `PUT` and `PATCH /queries`.                                                          |
+| `API_ALLOW_HOTBOARD_WRITE` | `false`                       | Permit `POST /hotboard/refresh` and the `/hotboard/*` writes.                               |
 | `API_ALLOW_SCHEDULE_WRITE` | `false`                       | Permit `PUT` and `PATCH /schedule`.                                                         |
 | `API_ALLOW_ENV_OVERRIDES`  | `false`                       | Permit arbitrary `env` fields in `/start` and `/restart`.                                   |
 | `API_ALLOW_CONFIG_REVEAL`  | `false`                       | Permit authenticated `GET /config?reveal=1`.                                                |
 | `API_VALIDATOR_MODULE`     | auto                          | Path to a compiled module exporting `validateConfig` or `ConfigSchema`.                     |
 | `SCHEDULE_FILE`            | `<repo>/config/schedule.json` | Override the persisted schedule file path.                                                  |
 | `CRON_SCHEDULE`            | unset                         | Base schedule reported and used when no persisted schedule override exists.                 |
-| `TZ`                       | `UTC`                         | Timezone used by cron and returned by `/schedule`.                                          |
+| `HOTBOARD_FILE`            | `<repo>/config/hotboard.json` | Override the persisted hot board configuration file path.                                   |
+| `HOTBOARD_CRON`            | `0 6 * * *`                   | Default hot board refresh cron while no `hotboard.json` exists.                             |
+| `HOTBOARD_SOURCE`          | `uapis.cn` hot board endpoint | Default hot board provider URL while no `hotboard.json` exists.                             |
+| `HOTBOARD_TYPE`            | `baidu`                       | Default provider board sent as `?type=` while no `hotboard.json` exists.                    |
+| `HOTBOARD_LIMIT`           | `0`                           | Default number of titles kept per refresh, `0` for every title.                             |
+| `TZ`                       | `UTC`                         | Timezone used by cron and returned by `/schedule` and `/hotboard`.                          |
 
 The Docker entrypoint also uses `API_MODE=true` to run this API as the main
 container process. In that mode, scheduled and `RUN_ON_START` executions are
@@ -2271,7 +2386,7 @@ Treat it as an administrative API.
   leave the machine.
 - Restrict `API_CORS_ORIGIN` to the actual dashboard origin instead of `*` when
   a browser accesses the API directly.
-- Leave config writes, schedule writes, query list writes, config reveal, and
+- Leave config writes, schedule writes, hot board writes, config reveal, and
   arbitrary environment overrides disabled unless they are required.
 - Avoid putting the API token in URLs except where browser SSE requires it.
 - Do not expose the port directly to the public internet.
@@ -2319,7 +2434,7 @@ services:
             API_TOKEN: '${API_TOKEN}'
             API_ALLOW_SCHEDULE_WRITE: 'true' # optional
             API_ALLOW_CONFIG_WRITE: 'true' # optional
-            API_ALLOW_QUERY_WRITE: 'true' # optional
+            API_ALLOW_HOTBOARD_WRITE: 'true' # optional
         ports:
             - '3010:3010'
 ```
@@ -2351,18 +2466,18 @@ starting a second unusable instance.
 
 ## File layout
 
-| File                | Responsibility                                                                        |
-| ------------------- | ------------------------------------------------------------------------------------- |
-| `server.js`         | HTTP routing, authentication, CORS, SSE, diagnostics, config, and schedule endpoints. |
-| `processManager.js` | Child-process lifecycle, process-tree termination, log buffering, and status events.  |
-| `logParser.js`      | Structured log parsing and live run/point accumulation.                               |
-| `accounts.js`       | Safe account summaries and child-only account selection/remapping.                    |
-| `configEditor.js`   | Config loading, validation, deep merge, backup, and atomic replacement.               |
-| `scheduleStore.js`  | Schedule validation, persistence, reads, and live crontab application.                |
-| `queryStore.js`     | Local search query list reads, validation, deduplication, and atomic mirrored writes. |
-| `queries-api.md`    | Code-generation reference for the `/queries` endpoints.                               |
-| `sessionStore.js`   | Safe session metadata reads and account-specific SQLite session deletion.             |
-| `apply-schedule.js` | Restores a persisted schedule override during Docker startup.                         |
-| `trigger.js`        | Routes Docker cron and `RUN_ON_START` executions through the local API.               |
-| `runCommand.js`     | Cross-platform resolution of the command used to launch the bot.                      |
-| `lib.js`            | Environment, project-root, logging, config-redaction, and argument helpers.           |
+| File                | Responsibility                                                                          |
+| ------------------- | --------------------------------------------------------------------------------------- |
+| `server.js`         | HTTP routing, authentication, CORS, SSE, diagnostics, config, and schedule endpoints.   |
+| `processManager.js` | Child-process lifecycle, process-tree termination, log buffering, and status events.    |
+| `logParser.js`      | Structured log parsing and live run/point accumulation.                                 |
+| `accounts.js`       | Safe account summaries and child-only account selection/remapping.                      |
+| `configEditor.js`   | Config loading, validation, deep merge, backup, and atomic replacement.                 |
+| `scheduleStore.js`  | Schedule validation, persistence, reads, and live crontab application.                  |
+| `hotboardStore.js`  | Hot board configuration, provider fetch, cron evaluation, and the in-process scheduler. |
+| `hotboard-api.md`   | Code-generation reference for the `/hotboard` endpoints.                                |
+| `sessionStore.js`   | Safe session metadata reads and account-specific SQLite session deletion.               |
+| `apply-schedule.js` | Restores a persisted schedule override during Docker startup.                           |
+| `trigger.js`        | Routes Docker cron and `RUN_ON_START` executions through the local API.                 |
+| `runCommand.js`     | Cross-platform resolution of the command used to launch the bot.                        |
+| `lib.js`            | Environment, project-root, logging, config-redaction, and argument helpers.             |

@@ -20,7 +20,7 @@
         "lint": "eslint .",
         "lint:fix": "eslint . --fix",
         "test:log-parser": "node --test scripts/api/logParser.test.js",
-        "test:query-store": "node --test scripts/api/queryStore.test.js",
+        "test:hotboard": "node --test scripts/api/hotboardStore.test.js",
         "format": "prettier --write .",
         "format:check": "prettier --check .",
         "clear-diagnostics": "rimraf diagnostics",

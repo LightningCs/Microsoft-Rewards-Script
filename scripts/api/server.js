@@ -15,7 +15,15 @@ import {
     syncMissingDefaults
 } from './configEditor.js'
 import { readSchedule, writeSchedule } from './scheduleStore.js'
-import { addQueries, readQueries, removeQueries, replaceQueries } from './queryStore.js'
+import {
+    SUPPORTED_TYPES,
+    createHotboardScheduler,
+    getHotboardStatus,
+    nextRunAt,
+    readHotboardConfig,
+    runHotboardRefresh,
+    writeHotboardConfig
+} from './hotboardStore.js'
 import { deleteStoredSessions, listStoredSessions } from './sessionStore.js'
 import { resolveRunCommand } from './runCommand.js'
 import {
@@ -115,10 +123,9 @@ const ALLOW_ENV_OVERRIDES = envBool('API_ALLOW_ENV_OVERRIDES', false)
 const REVEAL_ENABLED = envBool('API_ALLOW_CONFIG_REVEAL', false)
 const ALLOW_CONFIG_WRITE = envBool('API_ALLOW_CONFIG_WRITE', false)
 const ALLOW_SCHEDULE_WRITE = envBool('API_ALLOW_SCHEDULE_WRITE', false)
-const ALLOW_QUERY_WRITE = envBool('API_ALLOW_QUERY_WRITE', false)
+const ALLOW_HOTBOARD_WRITE = envBool('API_ALLOW_HOTBOARD_WRITE', false)
 
 const RUN_HISTORY = integerSetting('API_RUN_HISTORY', envStr('API_RUN_HISTORY'), 20)
-const QUERY_PAGE_LIMIT = 20000
 const DIAG_DIR = envStr('API_DIAGNOSTICS_DIR') ?? path.join(projectRoot, 'diagnostics')
 
 const { command, args } = resolveRunCommand({ projectRoot })
@@ -254,6 +261,56 @@ function readForce(body) {
     return body.force ?? false
 }
 
+function pickFields(body, allowed, endpoint) {
+    const unknown = Object.keys(body).filter(key => !allowed.includes(key))
+    if (unknown.length) {
+        throw Object.assign(
+            new Error(`${endpoint} accepts only ${allowed.join(', ')}. Unexpected: ${unknown.join(', ')}.`),
+            { code: 'BAD_REQUEST' }
+        )
+    }
+
+    const picked = {}
+    for (const key of allowed) {
+        if (key in body) picked[key] = body[key]
+    }
+    if (!Object.keys(picked).length) {
+        throw Object.assign(new Error(`${endpoint} requires at least one of ${allowed.join(', ')}.`), {
+            code: 'BAD_REQUEST'
+        })
+    }
+
+    return picked
+}
+
+const hotboardScheduler = createHotboardScheduler(projectRoot, {
+    log: (level, message) => pm.note(level, message)
+})
+
+function scheduleView(config) {
+    return {
+        enabled: config.enabled,
+        cron: config.cron,
+        timezone: config.timezone,
+        nextRunAt: config.enabled ? nextRunAt(config.cron, { timeZone: config.timezone }) : null,
+        origin: config.origin,
+        updatedAt: config.updatedAt,
+        writable: ALLOW_HOTBOARD_WRITE
+    }
+}
+
+function sourceView(config) {
+    return {
+        source: config.source,
+        type: config.type,
+        limit: config.limit,
+        supportedTypes: SUPPORTED_TYPES,
+        origin: config.origin,
+        updatedAt: config.updatedAt,
+        writable: ALLOW_HOTBOARD_WRITE
+    }
+}
+
 function handleEventStream(req, res, url) {
     res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
@@ -357,7 +414,10 @@ const requestHandler = async (req, res) => {
                     'GET /config/diff',
                     'POST /config/sync',
                     'GET /schedule',
-                    'GET /queries',
+                    'GET /hotboard',
+                    'GET /hotboard/schedule',
+                    'GET /hotboard/source',
+                    'POST /hotboard/refresh',
                     'POST /start',
                     'POST /stop',
                     'POST /restart',
@@ -365,7 +425,8 @@ const requestHandler = async (req, res) => {
                     'DELETE /sessions/:email',
                     'PUT|PATCH /config',
                     'PUT|PATCH /schedule',
-                    'PUT|PATCH /queries'
+                    'PUT|PATCH /hotboard/schedule',
+                    'PUT|PATCH /hotboard/source'
                 ]
             })
         }
@@ -575,94 +636,118 @@ const requestHandler = async (req, res) => {
             }
         }
 
-        // query list read
-        if (method === 'GET' && pathname === '/queries') {
+        // hot board read
+        if (method === 'GET' && pathname === '/hotboard') {
             try {
-                const result = readQueries(projectRoot)
-                const search = (url.searchParams.get('q') ?? '').trim().toLowerCase()
-                const offset = clampInt(url.searchParams.get('offset'), 0, Number.MAX_SAFE_INTEGER, 0)
-                const limit = url.searchParams.has('limit')
-                    ? clampInt(url.searchParams.get('limit'), 1, QUERY_PAGE_LIMIT, QUERY_PAGE_LIMIT)
-                    : null
-                const matched = search
-                    ? result.queries.filter(query => query.toLowerCase().includes(search))
-                    : result.queries
-                const page = limit === null ? matched.slice(offset) : matched.slice(offset, offset + limit)
-                return sendJson(res, 200, {
-                    ...result,
-                    writable: ALLOW_QUERY_WRITE,
-                    matched: matched.length,
-                    returned: page.length,
-                    offset,
-                    queries: page
-                })
+                return sendJson(res, 200, { ...getHotboardStatus(projectRoot), writable: ALLOW_HOTBOARD_WRITE })
             } catch (err) {
-                return sendJson(res, err.code === 'QUERY_FILE_MISSING' ? 404 : 500, {
-                    error: err.message,
-                    code: err.code
-                })
+                return sendJson(res, 500, { error: err.message, code: err.code })
             }
         }
 
-        // query list replace
-        if (method === 'PUT' && pathname === '/queries') {
-            if (!ALLOW_QUERY_WRITE) {
+        // hot board manual refresh
+        if (method === 'POST' && pathname === '/hotboard/refresh') {
+            const body = await readJsonObject(req)
+            if ('dryRun' in body && typeof body.dryRun !== 'boolean') {
+                return sendJson(res, 400, { error: '`dryRun` must be a boolean.', code: 'BAD_REQUEST' })
+            }
+            const dryRun = body.dryRun === true
+            if (!dryRun && !ALLOW_HOTBOARD_WRITE) {
                 return sendJson(res, 403, {
-                    error: 'Query list writes are disabled. Set API_ALLOW_QUERY_WRITE=true to enable.'
+                    error: 'Hot board writes are disabled. Set API_ALLOW_HOTBOARD_WRITE=true to enable.'
                 })
             }
-            const body = await readJsonBody(req)
-            const entries = Array.isArray(body) ? body : body?.queries
             try {
-                const result = replaceQueries(projectRoot, entries)
+                const result = await runHotboardRefresh(projectRoot, { trigger: 'manual', dryRun })
+                const payload = {
+                    ok: result.ok,
+                    error: result.error,
+                    httpStatus: result.httpStatus,
+                    durationMs: result.durationMs,
+                    dryRun,
+                    count: result.titles.length,
+                    upstreamUpdateTime: result.upstreamUpdateTime,
+                    written: result.written,
+                    lastRun: result.lastRun
+                }
+                if (!result.ok) {
+                    pm.note('warn', `Manual hot board refresh failed: ${result.error}`)
+                    return sendJson(res, 502, payload)
+                }
                 pm.note(
                     'info',
-                    `search-queries.json replaced via API ${method} /queries (${result.previousCount} -> ${result.count} queries).`
+                    dryRun
+                        ? `Hot board refresh (dry run) fetched ${result.titles.length} titles.`
+                        : `Hot board refreshed manually: ${result.titles.length} titles written to ${result.written.length} file(s).`
                 )
-                return sendJson(res, 200, { ok: true, ...result, writable: true, appliesImmediately: true })
+                return sendJson(res, 200, payload)
             } catch (err) {
                 const status = err.code === 'BAD_REQUEST' ? 400 : 500
                 return sendJson(res, status, { error: err.message, code: err.code })
             }
         }
 
-        // query list partial update
-        if (method === 'PATCH' && pathname === '/queries') {
-            if (!ALLOW_QUERY_WRITE) {
+        // hot board schedule read
+        if (method === 'GET' && pathname === '/hotboard/schedule') {
+            try {
+                return sendJson(res, 200, scheduleView(readHotboardConfig(projectRoot)))
+            } catch (err) {
+                return sendJson(res, 500, { error: err.message, code: err.code })
+            }
+        }
+
+        // hot board schedule write
+        if ((method === 'PUT' || method === 'PATCH') && pathname === '/hotboard/schedule') {
+            if (!ALLOW_HOTBOARD_WRITE) {
                 return sendJson(res, 403, {
-                    error: 'Query list writes are disabled. Set API_ALLOW_QUERY_WRITE=true to enable.'
+                    error: 'Hot board writes are disabled. Set API_ALLOW_HOTBOARD_WRITE=true to enable.'
                 })
             }
             const body = await readJsonObject(req)
-            const hasAdd = 'add' in body
-            const hasRemove = 'remove' in body
-            if (!hasAdd && !hasRemove) {
-                return sendJson(res, 400, {
-                    error: 'PATCH /queries requires `add`, `remove`, or both.',
-                    code: 'BAD_REQUEST'
-                })
-            }
             try {
-                const removal = hasRemove ? removeQueries(projectRoot, body.remove) : null
-                const addition = hasAdd ? addQueries(projectRoot, body.add) : null
-                const updated = readQueries(projectRoot)
+                const patch = pickFields(body, ['enabled', 'cron'], 'PUT/PATCH /hotboard/schedule')
+                const updated = writeHotboardConfig(projectRoot, patch)
+                hotboardScheduler.reload()
                 pm.note(
                     'info',
-                    `search-queries.json updated via API ${method} /queries (+${addition?.added.length ?? 0} / -${removal?.removed.length ?? 0}); now ${updated.total} queries.`
+                    `Hot board schedule updated via API (${method}): ${
+                        updated.enabled ? `${updated.cron} (TZ ${updated.timezone})` : 'disabled'
+                    }.`
                 )
-                return sendJson(res, 200, {
-                    ok: true,
-                    path: updated.path,
-                    written: [...new Set([...(removal?.written ?? []), ...(addition?.written ?? [])])],
-                    count: updated.total,
-                    previousCount: removal?.previousCount ?? addition?.previousCount ?? updated.total,
-                    added: addition?.added ?? [],
-                    skipped: addition?.skipped ?? [],
-                    removed: removal?.removed ?? [],
-                    notFound: removal?.notFound ?? [],
-                    writable: true,
-                    appliesImmediately: true
+                return sendJson(res, 200, scheduleView(updated))
+            } catch (err) {
+                const status = err.code === 'BAD_REQUEST' ? 400 : 500
+                return sendJson(res, status, { error: err.message, code: err.code })
+            }
+        }
+
+        // hot board source read
+        if (method === 'GET' && pathname === '/hotboard/source') {
+            try {
+                return sendJson(res, 200, sourceView(readHotboardConfig(projectRoot)))
+            } catch (err) {
+                return sendJson(res, 500, { error: err.message, code: err.code })
+            }
+        }
+
+        // hot board source write
+        if ((method === 'PUT' || method === 'PATCH') && pathname === '/hotboard/source') {
+            if (!ALLOW_HOTBOARD_WRITE) {
+                return sendJson(res, 403, {
+                    error: 'Hot board writes are disabled. Set API_ALLOW_HOTBOARD_WRITE=true to enable.'
                 })
+            }
+            const body = await readJsonObject(req)
+            try {
+                const patch = pickFields(body, ['source', 'type', 'limit'], 'PUT/PATCH /hotboard/source')
+                const updated = writeHotboardConfig(projectRoot, patch)
+                pm.note(
+                    'info',
+                    `Hot board source updated via API (${method}): ${updated.source} (type ${updated.type}, limit ${
+                        updated.limit || 'all'
+                    }).`
+                )
+                return sendJson(res, 200, sourceView(updated))
             } catch (err) {
                 const status = err.code === 'BAD_REQUEST' ? 400 : 500
                 return sendJson(res, status, { error: err.message, code: err.code })
@@ -898,6 +983,25 @@ function serveDiagnosticFile(res, pathname) {
     fs.createReadStream(full).pipe(res)
 }
 
+function startHotboardScheduler() {
+    try {
+        const config = readHotboardConfig(projectRoot)
+        log(
+            'INFO',
+            `Hot board: ${config.enabled ? `enabled (${config.cron}, TZ ${config.timezone})` : 'disabled'} | source: ${config.type} @ ${config.source} | writes: ${ALLOW_HOTBOARD_WRITE ? 'on' : 'off'}`
+        )
+        if (config.lastRun) {
+            log(
+                'INFO',
+                `Hot board last run: ${config.lastRun.ok ? 'ok' : 'failed'} at ${config.lastRun.at ?? 'unknown'} | trigger=${config.lastRun.trigger} | titles=${config.lastRun.count}${config.lastRun.error ? ` | ${config.lastRun.error}` : ''}`
+            )
+        }
+    } catch (err) {
+        log('WARN', `Hot board configuration is unusable: ${err instanceof Error ? err.message : err}`)
+    }
+    hotboardScheduler.start()
+}
+
 // startup
 const server = http.createServer(requestHandler)
 
@@ -919,8 +1023,9 @@ server.listen(PORT, HOST, () => {
     )
     log(
         'INFO',
-        `Runtime state: memory-only | config writes: ${ALLOW_CONFIG_WRITE ? 'on' : 'off'} | schedule writes: ${ALLOW_SCHEDULE_WRITE ? 'on' : 'off'} | query-list writes: ${ALLOW_QUERY_WRITE ? 'on' : 'off'} | session deletion: account-scoped`
+        `Runtime state: memory-only | config writes: ${ALLOW_CONFIG_WRITE ? 'on' : 'off'} | schedule writes: ${ALLOW_SCHEDULE_WRITE ? 'on' : 'off'} | hot board writes: ${ALLOW_HOTBOARD_WRITE ? 'on' : 'off'} | session deletion: account-scoped`
     )
+    startHotboardScheduler()
     if (!TOKEN) {
         const loopback = HOST === '127.0.0.1' || HOST === 'localhost' || HOST === '::1'
         log(
@@ -947,6 +1052,7 @@ async function shutdown(signal, { force = false } = {}) {
     if (shuttingDown) return
     shuttingDown = true
     log('INFO', `${signal} received - shutting down.`)
+    hotboardScheduler.stop()
     server.close()
     try {
         if (pm.getStatus().state !== 'idle') {

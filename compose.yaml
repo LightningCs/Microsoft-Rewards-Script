@@ -11,7 +11,7 @@ services:
             - ./sessions:/usr/src/microsoft-rewards-script/sessions
         env_file:
             # Load account credentials from the .env file (ACCOUNT_1_EMAIL, optional ACCOUNT_1_PASSWORD, etc.)
-            - path: .env
+            - path: account.env
         environment:
             # ── Scheduler ──────────────────────────────────────
             TZ: 'America/Toronto'
@@ -34,8 +34,7 @@ services:
             #API_ALLOW_SCHEDULE_WRITE: 'true'
             #API_ALLOW_ENV_OVERRIDES: 'true'
             #API_ALLOW_CONFIG_REVEAL: 'true'
-            #API_ALLOW_CONFIG_WRITE: 'true'
-            #API_ALLOW_QUERY_WRITE: 'true'
+            #API_ALLOW_HOTBOARD_WRITE: 'true'
 
             #  ── Configuration ──────────────────────────────────────
             # Uncomment to override defaults, a full list of configuration options are in the README.

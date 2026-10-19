@@ -550,15 +550,32 @@ export class QueryCore {
     }
 
     getLocalQueryList(): string[] {
+        const hot = this.readQueryListFile('search-queries.json')
+        if (hot.length) return hot
+
+        const bundled = this.readQueryListFile('search-queries.bundled.json')
+        if (!bundled.length) return []
+
+        this.bot.logger.debug(
+            this.bot.isMobile,
+            'SEARCH-LOCAL-QUERY-LIST',
+            `search-queries.json is empty - falling back to search-queries.bundled.json | queries=${bundled.length}`
+        )
+        return bundled
+    }
+
+    private readQueryListFile(name: string): string[] {
         try {
-            const file = path.join(__dirname, './search-queries.json')
-            const queries = JSON.parse(fs.readFileSync(file, 'utf8')) as string[]
-            return Array.isArray(queries) ? queries : []
+            const file = path.join(__dirname, name)
+            const queries = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown
+            if (!Array.isArray(queries)) return []
+
+            return queries.filter((query): query is string => typeof query === 'string' && query.trim().length > 0)
         } catch (error) {
             this.bot.logger.debug(
                 this.bot.isMobile,
                 'SEARCH-LOCAL-QUERY-LIST',
-                `Failed reading search-queries.json | ${error instanceof Error ? error.message : String(error)}`
+                `Failed reading ${name} | ${error instanceof Error ? error.message : String(error)}`
             )
             return []
         }

@@ -1,11 +1,12 @@
+# 全局 ARG 必须在第一个 FROM 之前声明，才能被 FROM 使用
+ARG BASE_IMAGE=ghcr.io/thenetsky/microsoft-rewards-script:base
+
 ###############################################################################
 # Stage 1: Builder
 ###############################################################################
 FROM node:24-slim AS builder
 
 WORKDIR /usr/src/microsoft-rewards-script
-
-ENV PLAYWRIGHT_BROWSERS_PATH=0
 
 # Copy package files
 COPY package.json package-lock.json tsconfig.json ./
@@ -25,82 +26,18 @@ RUN rm -rf node_modules \
 ###############################################################################
 # Stage 2: Runtime
 ###############################################################################
-FROM node:24-slim AS runtime
+FROM ${BASE_IMAGE} AS runtime
 
 WORKDIR /usr/src/microsoft-rewards-script
-
-# Set production environment variables
-ENV NODE_ENV=production \
-    TZ=UTC \
-    PLAYWRIGHT_BROWSERS_PATH=0 \
-    FORCE_HEADLESS=1 \
-    NODE_OPTIONS=--disable-warning=ExperimentalWarning
-
-# 在 apt-get update 前配置 apt 专用代理
-RUN echo 'Acquire::http::Proxy "'"${HTTP_PROXY}"'";' > /etc/apt/apt.conf.d/90proxy && \
-    echo 'Acquire::https::Proxy "'"${HTTP_PROXY}"'";' >> /etc/apt/apt.conf.d/90proxy && \
-    echo 'Acquire::Retries "5";' >> /etc/apt/apt.conf.d/90proxy && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    cron \
-    gettext-base \
-    jq \
-    tzdata \
-    ca-certificates \
-    libglib2.0-0 \
-    libdbus-1-3 \
-    libexpat1 \
-    libfontconfig1 \
-    libgtk-3-0 \
-    libnspr4 \
-    libnss3 \
-    libasound2 \
-    libflac12 \
-    libatk1.0-0 \
-    libatspi2.0-0 \
-    libdrm2 \
-    libgbm1 \
-    libdav1d6 \
-    libx11-6 \
-    libx11-xcb1 \
-    libxcomposite1 \
-    libxcursor1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxi6 \
-    libxrandr2 \
-    libxrender1 \
-    libxss1 \
-    libxtst6 \
-    libdouble-conversion3 \
-    fonts-liberation \
-    fonts-noto-core \
-    fonts-noto-color-emoji \
-    fonts-freefont-ttf \
-    fonts-droid-fallback \
-    && rm -f /etc/apt/apt.conf.d/90proxy \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Copy compiled application and dependencies from builder stage
 COPY --from=builder /usr/src/microsoft-rewards-script/dist ./dist
 COPY --from=builder /usr/src/microsoft-rewards-script/package*.json ./
 COPY --from=builder /usr/src/microsoft-rewards-script/node_modules ./node_modules
 
-# Install patchright's stealth-patched Chromium headless shell.
-# The container is headless-only so the full browser isn't needed; then clean up
-RUN set -eux; \
-    npx patchright install --with-deps --only-shell chromium; \
-    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
-
 # Copy config example into the image so entrypoint can use it as a fallback
 # when the user hasn't mounted their own config.json
 COPY config.example.json ./config.example.json
-
-# config.json is managed via the ./config bind mount (compose.yaml mounts
-# ./config to /usr/src/microsoft-rewards-script/config). On first run the
-# entrypoint generates config/config.json from this example if none exists,
-# then symlinks it to the project root where the script expects it.
-# Accounts come from ACCOUNT_N_* env vars, so no accounts.json is needed.
 
 # Copy runtime scripts with proper permissions from the start
 COPY --chmod=755 scripts/docker/run_daily.sh ./scripts/docker/run_daily.sh

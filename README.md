@@ -253,14 +253,14 @@ Desktop and mobile search quotas are tracked independently from the dashboard co
 
 Core sources:
 
-| Selector     | Source                                           |
-| ------------ | ------------------------------------------------ |
-| `google`     | Google Trends (trending searches)                |
-| `wikipedia`  | Wikipedia most-read articles (previous day)      |
-| `wikirandom` | Random Wikipedia articles                        |
-| `hackernews` | Hacker News front-page stories                   |
-| `reddit`     | Reddit r/popular post titles                     |
-| `local`      | Bundled `src/functions/search-queries.json` list |
+| Selector     | Source                                                                                      |
+| ------------ | ------------------------------------------------------------------------------------------- |
+| `google`     | Google Trends (trending searches)                                                           |
+| `wikipedia`  | Wikipedia most-read articles (previous day)                                                 |
+| `wikirandom` | Random Wikipedia articles                                                                   |
+| `hackernews` | Hacker News front-page stories                                                              |
+| `reddit`     | Reddit r/popular post titles                                                                |
+| `local`      | Hot board titles written by the control API, with `search-queries.bundled.json` as fallback |
 
 RSS feeds use a dotted path - `rss` for every feed, `rss.<site>` for a whole site, or `rss.<site>.<endpoint>` for a single feed:
 
