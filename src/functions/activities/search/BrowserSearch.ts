@@ -1,6 +1,7 @@
 import type { Page } from 'patchright'
 
 import { URLs } from '../../../constants/urls'
+import { withTimeout } from '../../../util/Utils'
 import { SearchQueryQueue } from '../../SearchQueryQueue'
 import { BaseActivity } from '../BaseActivity'
 import { BonusTracker } from './BonusTracker'
@@ -11,6 +12,7 @@ import type { MicrosoftRewardsBot } from '../../../index'
 
 const REFRESH_EVERY = 10
 const MAX_QUERY_ATTEMPTS = 5
+const SEARCH_ATTEMPT_TIMEOUT_MS = 120000
 
 const POINTS_MAX_SEARCHES = 100
 const POINTS_STAGNANT_LIMIT = 10
@@ -159,36 +161,11 @@ export class Search extends BaseActivity {
 
         for (let attempt = 1; attempt <= MAX_QUERY_ATTEMPTS; attempt++) {
             try {
-                const searchBox = page.locator(SEARCH_BOX)
-
-                await page.evaluate(() => window.scrollTo({ left: 0, top: 0, behavior: 'auto' }))
-                await page.keyboard.press('Home')
-                await searchBox.waitFor({ state: 'visible', timeout: 15000 })
-
-                await this.bot.utils.wait(1000)
-                await this.bot.browser.utils.ghostClick(page, SEARCH_BOX, { clickCount: 3 })
-                await searchBox.fill('')
-
-                await page.keyboard.type(query, { delay: this.bot.utils.randomDelay(45, 90) })
-                await page.keyboard.press('Enter')
-                await this.bot.utils.wait(3000)
-
-                if (this.bot.config.searchSettings.scrollRandomResults) {
-                    await this.bot.utils.wait(2000)
-                    await this.randomScroll(page, isMobile)
-                }
-                if (this.bot.config.searchSettings.clickRandomResults) {
-                    await this.bot.utils.wait(2000)
-                    await this.clickRandomLink(page, isMobile)
-                }
-
-                await this.bot.utils.wait(
-                    this.bot.utils.randomDelay(
-                        this.bot.config.searchSettings.searchDelay.min,
-                        this.bot.config.searchSettings.searchDelay.max
-                    )
+                await withTimeout(
+                    this.bingSearchAttempt(page, query, isMobile),
+                    SEARCH_ATTEMPT_TIMEOUT_MS,
+                    `Bing search attempt ${attempt}/${MAX_QUERY_ATTEMPTS} (query="${query}")`
                 )
-
                 return
             } catch (error) {
                 this.bot.logger.warn(
@@ -200,6 +177,38 @@ export class Search extends BaseActivity {
                 await this.bot.utils.wait(2000)
             }
         }
+    }
+
+    private async bingSearchAttempt(page: Page, query: string, isMobile: boolean): Promise<void> {
+        const searchBox = page.locator(SEARCH_BOX)
+
+        await page.evaluate(() => window.scrollTo({ left: 0, top: 0, behavior: 'auto' }))
+        await page.keyboard.press('Home')
+        await searchBox.waitFor({ state: 'visible', timeout: 15000 })
+
+        await this.bot.utils.wait(1000)
+        await this.bot.browser.utils.ghostClick(page, SEARCH_BOX, { clickCount: 3 })
+        await searchBox.fill('')
+
+        await page.keyboard.type(query, { delay: this.bot.utils.randomDelay(45, 90) })
+        await page.keyboard.press('Enter')
+        await this.bot.utils.wait(3000)
+
+        if (this.bot.config.searchSettings.scrollRandomResults) {
+            await this.bot.utils.wait(2000)
+            await this.randomScroll(page, isMobile)
+        }
+        if (this.bot.config.searchSettings.clickRandomResults) {
+            await this.bot.utils.wait(2000)
+            await this.clickRandomLink(page, isMobile)
+        }
+
+        await this.bot.utils.wait(
+            this.bot.utils.randomDelay(
+                this.bot.config.searchSettings.searchDelay.min,
+                this.bot.config.searchSettings.searchDelay.max
+            )
+        )
     }
 
     private async randomScroll(page: Page, isMobile: boolean) {

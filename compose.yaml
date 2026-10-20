@@ -6,6 +6,10 @@ services:
         #    context: .
         container_name: microsoft-rewards-script
         restart: unless-stopped
+        # 2-core/2GB host guard: cap container memory and process count so a Chromium
+        # spike cannot OOM the whole machine (the cron run will simply retry next run).
+        mem_limit: 1536m
+        pids_limit: 512
         volumes:
             - ./config:/usr/src/microsoft-rewards-script/config
             - ./sessions:/usr/src/microsoft-rewards-script/sessions

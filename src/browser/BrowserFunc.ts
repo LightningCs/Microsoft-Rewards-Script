@@ -6,13 +6,16 @@ import type { HttpRequestConfig } from '../util/Http'
 import type { MicrosoftRewardsBot } from '../index'
 import type { PageSnapshot, ParsedOffer } from './ReactFunc'
 import { loadSession, saveStorageState } from '../util/SessionStore'
-import { isBrowserClosedError } from '../util/Utils'
+import { isBrowserClosedError, withTimeout } from '../util/Utils'
 
 import type { DashboardData } from './../interface/DashboardData'
 import type { AppUserData } from '../interface/AppUserData'
 import type { AppEarnablePoints, BrowserEarnablePoints } from '../interface/Points'
 import type { AppDashboardData } from '../interface/AppDashBoardData'
 import { detectFlyoutBotWarning, mapFlyoutToDashboard, type RewardsFlyoutData } from './FlyoutDashboard'
+
+const SESSION_OPS_TIMEOUT_MS = 15000
+const CLOSE_BROWSER_TIMEOUT_MS = 20000
 
 export default class BrowserFunc {
     private bot: MicrosoftRewardsBot
@@ -526,7 +529,11 @@ export default class BrowserFunc {
 
         try {
             if (persistSession) {
-                const storageState = await browser.storageState()
+                const storageState = await withTimeout(
+                    browser.storageState(),
+                    SESSION_OPS_TIMEOUT_MS,
+                    'storageState (closeBrowser)'
+                )
                 this.bot.logger.debug(
                     this.bot.isMobile,
                     'CLOSE-BROWSER',
@@ -546,10 +553,14 @@ export default class BrowserFunc {
             }
         } finally {
             try {
-                await browser.close()
+                await withTimeout(browser.close(), CLOSE_BROWSER_TIMEOUT_MS, 'context.close (closeBrowser)')
 
                 if (rootBrowser) {
-                    await rootBrowser.close().catch(() => {})
+                    await withTimeout(
+                        rootBrowser.close(),
+                        CLOSE_BROWSER_TIMEOUT_MS,
+                        'browser.close (closeBrowser)'
+                    ).catch(() => {})
                 }
 
                 this.bot.logger.info(this.bot.isMobile, 'CLOSE-BROWSER', 'All browser resources closed.')
@@ -637,7 +648,11 @@ export default class BrowserFunc {
 
         try {
             const context = page.context()
-            let liveCookies = await context.cookies()
+            let liveCookies = await withTimeout(
+                context.cookies(),
+                SESSION_OPS_TIMEOUT_MS,
+                'context.cookies (synchronizeActiveBrowserCookies)'
+            )
 
             if (applyCached) {
                 const now = Date.now() / 1000
@@ -658,8 +673,12 @@ export default class BrowserFunc {
                 })
 
                 if (changed.length) {
-                    await context.addCookies(changed)
-                    liveCookies = await context.cookies()
+                    await withTimeout(context.addCookies(changed), SESSION_OPS_TIMEOUT_MS, 'context.addCookies (sync)')
+                    liveCookies = await withTimeout(
+                        context.cookies(),
+                        SESSION_OPS_TIMEOUT_MS,
+                        'context.cookies (sync after addCookies)'
+                    )
                 }
             }
 
@@ -711,14 +730,22 @@ export default class BrowserFunc {
     private async syncActiveCookies(page: Page, source: string, forcePersist = false): Promise<void> {
         try {
             const context = page.context()
-            const liveCookies = await context.cookies()
+            const liveCookies = await withTimeout(
+                context.cookies(),
+                SESSION_OPS_TIMEOUT_MS,
+                `context.cookies (${source})`
+            )
             const changed = this.updateCookieCache(liveCookies, source)
             if (!changed && !forcePersist) return
 
             const email = this.bot.currentAccountEmail
             if (!email) return
 
-            const storageState = await context.storageState()
+            const storageState = await withTimeout(
+                context.storageState(),
+                SESSION_OPS_TIMEOUT_MS,
+                `context.storageState (${source})`
+            )
             saveStorageState(this.bot.config.sessionPath, email, this.bot.isMobile, storageState)
             this.bot.logger.debug(
                 this.bot.isMobile,

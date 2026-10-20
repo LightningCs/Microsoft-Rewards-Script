@@ -133,6 +133,7 @@ export const ConfigSchema = z.object({
         .default({ urlReward: true, searchOnBing: true }),
     searchOnBingLocalQueries: z.boolean(),
     globalTimeout: NumberOrString,
+    accountTimeout: DurationValue.default('2h'),
     searchSettings: z.object({
         scrollRandomResults: z.boolean(),
         clickRandomResults: z.boolean(),
@@ -275,12 +276,13 @@ const defaultConfig: Config = {
     },
     searchOnBingLocalQueries: false,
     globalTimeout: '30sec',
+    accountTimeout: '2h',
     searchSettings: {
         scrollRandomResults: true,
         clickRandomResults: true,
         runOnZeroPoints: false,
         maxBonusSearches: 110,
-        parallelSearching: true,
+        parallelSearching: false,
         clusterSearch: true,
         queryEngines: ['google', 'wikipedia', 'wikirandom', 'hackernews', 'reddit', 'local'],
         searchResultVisitTime: '10sec',
@@ -290,7 +292,7 @@ const defaultConfig: Config = {
     experimental: {
         apiSearch: false,
         apiSearchOnBing: false,
-        blockMedia: false,
+        blockMedia: true,
         edgeBrowsing: false
     },
     debugLogs: false,

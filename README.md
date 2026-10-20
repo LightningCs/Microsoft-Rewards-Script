@@ -186,20 +186,21 @@ Edit `config.json` to customize behavior, or set `CONFIG_*` environment variable
 
 ### Core
 
-| Setting                     | Type    | Default      | Description                                                        | Docker environment variable           |
-| --------------------------- | ------- | ------------ | ------------------------------------------------------------------ | ------------------------------------- |
-| `sessionPath`               | string  | `"sessions"` | Directory to store browser sessions                                |                                       |
-| `headless`                  | boolean | `false`      | Run browser invisibly                                              | Always `true` in Docker               |
-| `clusters`                  | number  | `1`          | Number of concurrent account clusters                              | `CONFIG_CLUSTERS`                     |
-| `errorDiagnostics`          | boolean | `false`      | Save error and unknown-login page diagnostics under `diagnostics/` | `CONFIG_ERROR_DIAGNOSTICS`            |
-| `ensureStreakProtection`    | boolean | `true`       | Ensure streak protection is enabled                                | `CONFIG_ENSURE_STREAK_PROTECTION`     |
-| `autoClaimPunchcardRewards` | boolean | `false`      | Auto-claim completed punchcard rewards                             | `CONFIG_AUTO_CLAIM_PUNCHCARD_REWARDS` |
-| `contintueOnBotWarning`     | boolean | `false`      | Continue despite the Microsoft bot-score warning (not recommended) | `CONFIG_CONTINTUE_ON_BOT_WARNING`     |
-| `skipNonPointTasks`         | boolean | `true`       | Skip tasks that award no points                                    | `CONFIG_SKIP_NON_POINT_TASKS`         |
-| `accountDelay.min`          | string  | `"1min"`     | Minimum delay before starting the next configured account          | `CONFIG_ACCOUNT_DELAY_MIN`            |
-| `accountDelay.max`          | string  | `"3min"`     | Maximum delay before starting the next configured account          | `CONFIG_ACCOUNT_DELAY_MAX`            |
-| `searchOnBingLocalQueries`  | boolean | `false`      | Use the local query list for ExploreOnBing                         | `CONFIG_SEARCH_ON_BING_LOCAL`         |
-| `globalTimeout`             | string  | `"30sec"`    | Timeout for all actions                                            | `CONFIG_GLOBAL_TIMEOUT`               |
+| Setting                     | Type    | Default      | Description                                                                                                            | Docker environment variable           |
+| --------------------------- | ------- | ------------ | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `sessionPath`               | string  | `"sessions"` | Directory to store browser sessions                                                                                    |                                       |
+| `headless`                  | boolean | `false`      | Run browser invisibly                                                                                                  | Always `true` in Docker               |
+| `clusters`                  | number  | `1`          | Number of concurrent account clusters                                                                                  | `CONFIG_CLUSTERS`                     |
+| `errorDiagnostics`          | boolean | `false`      | Save error and unknown-login page diagnostics under `diagnostics/`                                                     | `CONFIG_ERROR_DIAGNOSTICS`            |
+| `ensureStreakProtection`    | boolean | `true`       | Ensure streak protection is enabled                                                                                    | `CONFIG_ENSURE_STREAK_PROTECTION`     |
+| `autoClaimPunchcardRewards` | boolean | `false`      | Auto-claim completed punchcard rewards                                                                                 | `CONFIG_AUTO_CLAIM_PUNCHCARD_REWARDS` |
+| `contintueOnBotWarning`     | boolean | `false`      | Continue despite the Microsoft bot-score warning (not recommended)                                                     | `CONFIG_CONTINTUE_ON_BOT_WARNING`     |
+| `skipNonPointTasks`         | boolean | `true`       | Skip tasks that award no points                                                                                        | `CONFIG_SKIP_NON_POINT_TASKS`         |
+| `accountDelay.min`          | string  | `"1min"`     | Minimum delay before starting the next configured account                                                              | `CONFIG_ACCOUNT_DELAY_MIN`            |
+| `accountDelay.max`          | string  | `"3min"`     | Maximum delay before starting the next configured account                                                              | `CONFIG_ACCOUNT_DELAY_MAX`            |
+| `searchOnBingLocalQueries`  | boolean | `false`      | Use the local query list for ExploreOnBing                                                                             | `CONFIG_SEARCH_ON_BING_LOCAL`         |
+| `globalTimeout`             | string  | `"30sec"`    | Timeout for all actions                                                                                                | `CONFIG_GLOBAL_TIMEOUT`               |
+| `accountTimeout`            | string  | `"2h"`       | Hard per-account watchdog; when exceeded the account is aborted and the run continues with the next one (`0` disables) | `CONFIG_ACCOUNT_TIMEOUT`              |
 
 ### Workers
 
@@ -233,7 +234,7 @@ Edit `config.json` to customize behavior, or set `CONFIG_*` environment variable
 | `searchSettings.clickRandomResults`    | boolean  | `false`                             | Click random links                                        | `CONFIG_SEARCH_CLICK_RANDOM`       |
 | `searchSettings.runOnZeroPoints`       | boolean  | `false`                             | Run searches even when no search points remain            | `CONFIG_SEARCH_RUN_ON_ZERO_POINTS` |
 | `searchSettings.maxBonusSearches`      | number   | `110`                               | Max bonus searches per run (when `doBonusSearches` is on) | `CONFIG_SEARCH_MAX_BONUS_SEARCHES` |
-| `searchSettings.parallelSearching`     | boolean  | `true`                              | Run searches in parallel                                  | `CONFIG_SEARCH_PARALLEL`           |
+| `searchSettings.parallelSearching`     | boolean  | `false`                             | Run searches in parallel (disable on low-memory hosts)    | `CONFIG_SEARCH_PARALLEL`           |
 | `searchSettings.clusterSearch`         | boolean  | `true`                              | Cluster each main topic with Bing suggestions             | `CONFIG_SEARCH_CLUSTER`            |
 | `searchSettings.queryEngines`          | string[] | see [Query sources](#query-sources) | Sources used to build the search query pool               | `CONFIG_SEARCH_QUERY_ENGINES` \*   |
 | `searchSettings.searchResultVisitTime` | string   | `"10sec"`                           | Time to spend on each search result                       | `CONFIG_SEARCH_VISIT_TIME`         |
@@ -243,6 +244,8 @@ Edit `config.json` to customize behavior, or set `CONFIG_*` environment variable
 | `searchSettings.readDelay.max`         | string   | `"1min"`                            | Maximum delay for reading                                 | `CONFIG_SEARCH_READ_DELAY_MAX`     |
 
 Desktop and mobile search quotas are tracked independently from the dashboard counters. All `mobileSearch` entries are combined for the mobile quota, while all `pcSearch` entries are combined for desktop execution; a counter explicitly identified as Edge is also shown separately for diagnostics. The script skips only the completed platform, so a completed `60/60` mobile quota does not prevent an incomplete desktop quota from running. With `parallelSearching` enabled, both incomplete quotas can run concurrently in their own browser contexts.
+
+**Concurrency & resilience.** Accounts are distributed across `clusters` worker processes (each worker runs its accounts strictly one after another, with `accountDelay` between them). Every account is additionally guarded by `accountTimeout`: if an account stalls (e.g. a hung browser tab during session teardown), it is aborted, its browser sessions are force-closed, and the run continues with the next account. Set `accountTimeout` to `0` to disable the watchdog. If you want true parallel execution of multiple accounts, set `clusters` to the number of accounts you want to run at once (one account per worker is the recommended ratio). On low-memory hosts (2 GB or less), keep `clusters` at `1` and set `searchSettings.parallelSearching` to `false` so only one browser is open at a time, and cap the container memory in `compose.yaml` (`mem_limit`) so a Chromium spike cannot OOM the host.
 
 > [!NOTE]
 > \* Docker `CONFIG_*` array values are comma-separated strings e.g. `"error,warn"`. Regex patterns must be set directly in `config.json`.
@@ -302,7 +305,7 @@ Opt-in features that may change. Disabled by default.
 | ------------------------------ | ------- | ------- | ----------------------------------------------------------------------- | ---------------------------------------- |
 | `experimental.apiSearch`       | boolean | `false` | Perform Bing searches over HTTP instead of driving a browser page       | `CONFIG_EXPERIMENTAL_API_SEARCH`         |
 | `experimental.apiSearchOnBing` | boolean | `false` | Complete ExploreOnBing offers over HTTP instead of the browser          | `CONFIG_EXPERIMENTAL_API_SEARCH_ON_BING` |
-| `experimental.blockMedia`      | boolean | `false` | Block post-login browser `image` and `media` requests to reduce traffic | `CONFIG_EXPERIMENTAL_BLOCK_MEDIA`        |
+| `experimental.blockMedia`      | boolean | `true`  | Block post-login browser `image` and `media` requests to reduce traffic | `CONFIG_EXPERIMENTAL_BLOCK_MEDIA`        |
 | `experimental.edgeBrowsing`    | boolean | `false` | Report the 30-minute Edge browsing activity as a background HTTP task   | `CONFIG_EXPERIMENTAL_EDGE_BROWSING`      |
 
 When `experimental.blockMedia` is enabled, the automated flow activates it only after authentication has been

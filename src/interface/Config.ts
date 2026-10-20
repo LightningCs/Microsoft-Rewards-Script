@@ -12,6 +12,7 @@ export interface Config {
     activities: ConfigActivities
     searchOnBingLocalQueries: boolean
     globalTimeout: number | string
+    accountTimeout: number | string
     searchSettings: ConfigSearchSettings
     experimental: ConfigExperimental
     debugLogs: boolean

@@ -31,12 +31,13 @@
     },
     "searchOnBingLocalQueries": false,
     "globalTimeout": "30sec",
+    "accountTimeout": "2h",
     "searchSettings": {
         "scrollRandomResults": false,
         "clickRandomResults": false,
         "runOnZeroPoints": false,
         "maxBonusSearches": 110,
-        "parallelSearching": true,
+        "parallelSearching": false,
         "clusterSearch": true,
         "queryEngines": [
             "google",
@@ -64,7 +65,7 @@
     "experimental": {
         "apiSearch": false,
         "apiSearchOnBing": false,
-        "blockMedia": false,
+        "blockMedia": true,
         "edgeBrowsing": false
     },
     "debugLogs": false,

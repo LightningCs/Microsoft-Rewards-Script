@@ -1,5 +1,42 @@
 import ms, { StringValue } from 'ms'
 
+export class TimeoutError extends Error {
+    constructor(message: string) {
+        super(message)
+        this.name = 'TimeoutError'
+    }
+}
+
+/**
+ * Race a promise against a wall-clock timeout. A non-positive or non-finite
+ * timeout disables the guard and returns the promise untouched. The underlying
+ * promise is always given a rejection handler so a late rejection after the
+ * timeout fired can never surface as an unhandled rejection.
+ */
+export function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return promise
+
+    promise.catch(() => {})
+
+    return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => {
+            reject(new TimeoutError(`${label} timed out after ${timeoutMs}ms`))
+        }, timeoutMs)
+        if (typeof timer.unref === 'function') timer.unref()
+
+        promise.then(
+            value => {
+                clearTimeout(timer)
+                resolve(value)
+            },
+            error => {
+                clearTimeout(timer)
+                reject(error)
+            }
+        )
+    })
+}
+
 export function isBrowserClosedError(error: unknown): boolean {
     const msg = (error instanceof Error ? error.message : String(error ?? '')).toLowerCase()
     if (!msg) return false
