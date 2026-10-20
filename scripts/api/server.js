@@ -301,7 +301,8 @@ function scheduleView(config) {
 
 function sourceView(config) {
     return {
-        source: config.source,
+        sources: config.sources,
+        source: config.sources[0] ?? null, // legacy single-URL alias
         type: config.type,
         limit: config.limit,
         supportedTypes: SUPPORTED_TYPES,
@@ -659,6 +660,11 @@ const requestHandler = async (req, res) => {
             }
             try {
                 const result = await runHotboardRefresh(projectRoot, { trigger: 'manual', dryRun })
+                for (const attempt of result.attempts ?? []) {
+                    if (!attempt.ok) {
+                        pm.note('warn', `Hot board source failed: ${attempt.url} | ${attempt.error}`)
+                    }
+                }
                 const payload = {
                     ok: result.ok,
                     error: result.error,
@@ -667,6 +673,8 @@ const requestHandler = async (req, res) => {
                     dryRun,
                     count: result.titles.length,
                     upstreamUpdateTime: result.upstreamUpdateTime,
+                    usedSource: result.usedSource,
+                    failedSources: result.failedSources ?? [],
                     written: result.written,
                     lastRun: result.lastRun
                 }
@@ -677,8 +685,8 @@ const requestHandler = async (req, res) => {
                 pm.note(
                     'info',
                     dryRun
-                        ? `Hot board refresh (dry run) fetched ${result.titles.length} titles.`
-                        : `Hot board refreshed manually: ${result.titles.length} titles written to ${result.written.length} file(s).`
+                        ? `Hot board refresh (dry run) fetched ${result.titles.length} titles from ${result.usedSource ?? 'unknown'}.`
+                        : `Hot board refreshed manually: ${result.titles.length} titles from ${result.usedSource ?? 'unknown'} written to ${result.written.length} file(s).`
                 )
                 return sendJson(res, 200, payload)
             } catch (err) {
@@ -739,13 +747,13 @@ const requestHandler = async (req, res) => {
             }
             const body = await readJsonObject(req)
             try {
-                const patch = pickFields(body, ['source', 'type', 'limit'], 'PUT/PATCH /hotboard/source')
+                const patch = pickFields(body, ['sources', 'source', 'type', 'limit'], 'PUT/PATCH /hotboard/source')
                 const updated = writeHotboardConfig(projectRoot, patch)
                 pm.note(
                     'info',
-                    `Hot board source updated via API (${method}): ${updated.source} (type ${updated.type}, limit ${
-                        updated.limit || 'all'
-                    }).`
+                    `Hot board sources updated via API (${method}): ${updated.sources.join(', ')} (type ${
+                        updated.type
+                    }, limit ${updated.limit || 'all'}).`
                 )
                 return sendJson(res, 200, sourceView(updated))
             } catch (err) {
@@ -988,7 +996,9 @@ function startHotboardScheduler() {
         const config = readHotboardConfig(projectRoot)
         log(
             'INFO',
-            `Hot board: ${config.enabled ? `enabled (${config.cron}, TZ ${config.timezone})` : 'disabled'} | source: ${config.type} @ ${config.source} | writes: ${ALLOW_HOTBOARD_WRITE ? 'on' : 'off'}`
+            `Hot board: ${config.enabled ? `enabled (${config.cron}, TZ ${config.timezone})` : 'disabled'} | source: ${config.type} @ ${
+                config.sources?.join(', ') ?? 'none'
+            } | writes: ${ALLOW_HOTBOARD_WRITE ? 'on' : 'off'}`
         )
         if (config.lastRun) {
             log(

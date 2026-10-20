@@ -106,12 +106,29 @@ test('falls back to environment defaults when no configuration file exists', () 
 
     assert.equal(config.enabled, true)
     assert.equal(config.cron, '0 6 * * *')
-    assert.equal(config.source, 'https://uapis.cn/api/v1/misc/hotboard')
+    assert.deepEqual(config.sources, ['https://uapis.cn/api/v1/misc/hotboard'])
     assert.equal(config.type, 'baidu')
     assert.equal(config.limit, 0)
     assert.equal(config.origin, 'env')
     assert.equal(config.path, configFile)
     assert.equal(fs.existsSync(configFile), false)
+})
+
+test('defaults split comma-separated HOTBOARD_SOURCES from the environment', () => {
+    const { root } = createProject()
+    const savedSources = process.env.HOTBOARD_SOURCES
+    const savedSource = process.env.HOTBOARD_SOURCE
+    try {
+        delete process.env.HOTBOARD_SOURCES
+        process.env.HOTBOARD_SOURCE = 'https://one.example, https://two.example/api, bad-url, https://one.example'
+        const config = readHotboardConfig(root)
+        assert.deepEqual(config.sources, ['https://one.example', 'https://two.example/api'])
+    } finally {
+        if (savedSources === undefined) delete process.env.HOTBOARD_SOURCES
+        else process.env.HOTBOARD_SOURCES = savedSources
+        if (savedSource === undefined) delete process.env.HOTBOARD_SOURCE
+        else process.env.HOTBOARD_SOURCE = savedSource
+    }
 })
 
 test('persists configuration changes and validates every field', () => {
@@ -137,7 +154,15 @@ test('persists configuration changes and validates every field', () => {
         err => err.code === 'BAD_REQUEST'
     )
     assert.throws(
-        () => writeHotboardConfig(root, { source: 'ftp://example.com' }),
+        () => writeHotboardConfig(root, { sources: ['ftp://example.com'] }),
+        err => err.code === 'BAD_REQUEST'
+    )
+    assert.throws(
+        () => writeHotboardConfig(root, { sources: [] }),
+        err => err.code === 'BAD_REQUEST'
+    )
+    assert.throws(
+        () => writeHotboardConfig(root, { sources: 'not-an-array' }),
         err => err.code === 'BAD_REQUEST'
     )
     assert.throws(
@@ -155,6 +180,39 @@ test('persists configuration changes and validates every field', () => {
     assert.equal(readJson(configFile).cron, '30 7 * * *')
 })
 
+test('writeHotboardConfig accepts a sources array and a legacy single source', () => {
+    const { root, configFile } = createProject()
+
+    const multi = writeHotboardConfig(root, {
+        sources: ['https://a.example/hotboard', 'https://a.example/hotboard', 'https://b.example/hotboard']
+    })
+    assert.deepEqual(multi.sources, ['https://a.example/hotboard', 'https://b.example/hotboard'])
+    assert.equal(multi.source, 'https://a.example/hotboard')
+    assert.deepEqual(readJson(configFile).sources, ['https://a.example/hotboard', 'https://b.example/hotboard'])
+
+    const legacy = writeHotboardConfig(root, { source: 'https://legacy.example/hotboard' })
+    assert.deepEqual(legacy.sources, ['https://legacy.example/hotboard'])
+    assert.deepEqual(readJson(configFile).sources, ['https://legacy.example/hotboard'])
+})
+
+test('migrates a legacy single `source` entry in the config file to `sources`', () => {
+    const { root, configFile } = createProject()
+    fs.mkdirSync(path.dirname(configFile), { recursive: true })
+    fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+            enabled: true,
+            cron: '0 6 * * *',
+            source: 'https://legacy.example/hotboard',
+            type: 'baidu',
+            limit: 0
+        })
+    )
+
+    const config = readHotboardConfig(root)
+    assert.deepEqual(config.sources, ['https://legacy.example/hotboard'])
+})
+
 test('reports a corrupt configuration file instead of crashing', () => {
     const { root, configFile } = createProject()
     fs.mkdirSync(path.dirname(configFile), { recursive: true })
@@ -167,7 +225,7 @@ test('reports a corrupt configuration file instead of crashing', () => {
 })
 
 test('fetchHotboard extracts, normalizes, dedupes and truncates titles', async () => {
-    const config = { source: 'https://uapis.cn/api/v1/misc/hotboard', type: 'baidu', limit: 2 }
+    const config = { sources: ['https://uapis.cn/api/v1/misc/hotboard'], type: 'baidu', limit: 2 }
     const body = payload(['  第一条  热搜 ', '第二条热搜', '第一条 热搜', 42, '第三条热搜'])
 
     const result = await withFetch(jsonFetch(body), () => fetchHotboard(config))
@@ -176,10 +234,13 @@ test('fetchHotboard extracts, normalizes, dedupes and truncates titles', async (
     assert.equal(result.httpStatus, 200)
     assert.equal(result.upstreamUpdateTime, '2026-10-19T01:58:00.000Z')
     assert.deepEqual(result.titles, ['第一条 热搜', '第二条热搜'])
+    assert.equal(result.usedSource, 'https://uapis.cn/api/v1/misc/hotboard')
+    assert.deepEqual(result.failedSources, [])
+    assert.equal(result.attempts.length, 1)
 })
 
 test('fetchHotboard surfaces upstream errors and malformed payloads', async () => {
-    const config = { source: 'https://uapis.cn/api/v1/misc/hotboard', type: 'nope', limit: 0 }
+    const config = { sources: ['https://uapis.cn/api/v1/misc/hotboard'], type: 'nope', limit: 0 }
 
     const upstreamError = await withFetch(jsonFetch({ code: 400, message: 'type is invalid' }, 400), () =>
         fetchHotboard(config)
@@ -208,6 +269,49 @@ test('fetchHotboard surfaces upstream errors and malformed payloads', async () =
     assert.equal(rejected.ok, false)
     assert.equal(rejected.httpStatus, null)
     assert.match(rejected.error, /ENOTFOUND/)
+})
+
+test('fetchHotboard round-robins sources and falls back on failure', async () => {
+    const good = 'https://good.example/hotboard'
+    const bad = 'https://bad.example/hotboard'
+    const config = { sources: [bad, good], type: 'baidu', limit: 0 }
+    const calls = []
+    const stub = async url => {
+        calls.push(url)
+        if (url.includes('bad.example')) return { ok: false, status: 500, text: async () => 'boom' }
+        return jsonFetch(payload(['from good source']))(url)
+    }
+
+    const first = await withFetch(stub, () => fetchHotboard(config))
+    assert.equal(first.ok, true)
+    assert.equal(first.usedSource, good)
+    assert.deepEqual(first.failedSources, [bad])
+    assert.equal(first.attempts.length, 2)
+    assert.equal(first.attempts[0].url, bad)
+    assert.equal(first.attempts[1].url, good)
+    assert.deepEqual(first.titles, ['from good source'])
+    assert.deepEqual(calls, [`${bad}?type=baidu`, `${good}?type=baidu`])
+
+    // rotation pointer advanced: the next refresh starts at `good` and succeeds immediately
+    const second = await withFetch(stub, () => fetchHotboard(config))
+    assert.equal(second.ok, true)
+    assert.equal(second.usedSource, good)
+    assert.deepEqual(calls.slice(2), [`${good}?type=baidu`])
+})
+
+test('fetchHotboard reports every failed source when all sources fail', async () => {
+    const config = { sources: ['https://a.example/hotboard', 'https://b.example/hotboard'], type: 'baidu', limit: 0 }
+
+    const result = await withFetch(
+        async () => ({ ok: false, status: 503, text: async () => 'down' }),
+        () => fetchHotboard(config)
+    )
+
+    assert.equal(result.ok, false)
+    assert.equal(result.usedSource, null)
+    assert.deepEqual(result.failedSources, ['https://a.example/hotboard', 'https://b.example/hotboard'])
+    assert.equal(result.attempts.length, 2)
+    assert.match(result.error, /Upstream responded 503/)
 })
 
 test('writeQueryList writes every existing copy with pretty JSON', () => {
@@ -279,6 +383,7 @@ test('getHotboardStatus exposes schedule, source, query file and supported types
     assert.equal(status.enabled, true)
     assert.equal(status.origin, 'env')
     assert.equal(typeof status.nextRunAt, 'string')
+    assert.deepEqual(status.sources, ['https://uapis.cn/api/v1/misc/hotboard'])
     assert.equal(status.queryFile.count, 2)
     assert.deepEqual(status.supportedTypes, SUPPORTED_TYPES)
     assert.equal(status.limits.maxLimit, 500)

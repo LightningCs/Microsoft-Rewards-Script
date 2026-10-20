@@ -5,16 +5,21 @@ import { isValidCron } from './scheduleStore.js'
 
 const QUERY_FILE = 'search-queries.json'
 const DEFAULT_SOURCE = 'https://uapis.cn/api/v1/misc/hotboard'
+const DEFAULT_SOURCES = [DEFAULT_SOURCE]
 const DEFAULT_CRON = '0 6 * * *'
 const DEFAULT_TYPE = 'baidu'
 const SUPPORTED_TYPES = ['baidu', 'weibo', 'zhihu', 'douyin', 'bilibili', 'toutiao']
 const MAX_LIMIT = 500
 const MAX_TITLES_IN_STATE = 100
 const MAX_MESSAGE_LENGTH = 300
+const MAX_SOURCES = 10
 const FETCH_TIMEOUT_MS = 15_000
 const SCHEDULER_INTERVAL_MS = 20_000
 const MAX_SCAN_MINUTES = 7 * 24 * 60
 const TYPE_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/i
+
+// Round-robin pointer over the configured sources; advances by one after every refresh.
+let sourceRotationIndex = 0
 
 const CRON_FIELD_RANGES = [
     { min: 0, max: 59 }, // minute
@@ -46,12 +51,28 @@ export function hotboardFilePath(projectRoot) {
     return process.env.HOTBOARD_FILE || path.join(projectRoot, 'config', 'hotboard.json')
 }
 
+function splitSources(raw) {
+    if (typeof raw !== 'string' || !raw.trim()) return []
+    const seen = new Set()
+    const sources = []
+    for (const part of raw.split(',')) {
+        const url = part.trim()
+        if (!url || !isValidSource(url)) continue
+        const key = url.toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        sources.push(url)
+    }
+    return sources
+}
+
 function defaultsFromEnv() {
     const limit = Number(process.env.HOTBOARD_LIMIT ?? 0)
+    const sources = splitSources(process.env.HOTBOARD_SOURCES || process.env.HOTBOARD_SOURCE || DEFAULT_SOURCE)
     return {
         enabled: true,
         cron: (process.env.HOTBOARD_CRON || DEFAULT_CRON).trim(),
-        source: (process.env.HOTBOARD_SOURCE || DEFAULT_SOURCE).trim(),
+        sources: sources.length ? sources : [DEFAULT_SOURCE],
         type: (process.env.HOTBOARD_TYPE || DEFAULT_TYPE).trim(),
         limit: Number.isSafeInteger(limit) ? limit : 0
     }
@@ -67,12 +88,34 @@ function isValidSource(value) {
     }
 }
 
+function normalizeSources(values) {
+    const seen = new Set()
+    const sources = []
+    for (const value of values) {
+        const url = typeof value === 'string' ? value.trim() : ''
+        if (!url) continue
+        const key = url.toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        sources.push(url)
+    }
+    return sources
+}
+
 function validateValues(values, code) {
     if (typeof values.enabled !== 'boolean') fail(code, '`enabled` must be a boolean.')
     if (typeof values.cron !== 'string' || !isValidCron(values.cron)) {
         fail(code, '`cron` must be a five-field cron expression, such as "0 6 * * *".')
     }
-    if (!isValidSource(values.source)) fail(code, '`source` must be an absolute http(s) URL.')
+    if (!Array.isArray(values.sources) || values.sources.length === 0) {
+        fail(code, '`sources` must be a non-empty array of http(s) URLs.')
+    }
+    if (values.sources.length > MAX_SOURCES) {
+        fail(code, `\`sources\` may contain at most ${MAX_SOURCES} URLs.`)
+    }
+    for (const url of values.sources) {
+        if (!isValidSource(url)) fail(code, `Invalid source URL: ${url}.`)
+    }
     if (typeof values.type !== 'string' || !TYPE_PATTERN.test(values.type.trim())) {
         fail(code, '`type` must be a source identifier such as "baidu".')
     }
@@ -97,6 +140,10 @@ function normalizeLastRun(value) {
         count: Number.isSafeInteger(value.count) ? value.count : 0,
         written: Number.isSafeInteger(value.written) ? value.written : 0,
         upstreamUpdateTime: typeof value.upstreamUpdateTime === 'string' ? value.upstreamUpdateTime : null,
+        usedSource: typeof value.usedSource === 'string' ? value.usedSource : null,
+        failedSources: Array.isArray(value.failedSources)
+            ? value.failedSources.filter(url => typeof url === 'string').slice(0, MAX_SOURCES)
+            : [],
         error: typeof value.error === 'string' ? value.error : null,
         titles
     }
@@ -120,10 +167,20 @@ export function readHotboardConfig(projectRoot) {
         fail('CORRUPT_HOTBOARD', 'hotboard.json must contain a JSON object.')
     }
 
+    // `sources` is the canonical field; a legacy single `source` entry is migrated.
+    let sources
+    if (Array.isArray(saved.sources) && saved.sources.length > 0) {
+        sources = normalizeSources(saved.sources)
+    } else if (typeof saved.source === 'string' && saved.source.trim()) {
+        sources = [saved.source.trim()]
+    } else {
+        sources = base.sources
+    }
+
     const values = {
         enabled: saved.enabled === undefined ? base.enabled : saved.enabled,
         cron: saved.cron === undefined ? base.cron : saved.cron,
-        source: saved.source === undefined ? base.source : saved.source,
+        sources,
         type: saved.type === undefined ? base.type : saved.type,
         limit: saved.limit === undefined ? base.limit : saved.limit
     }
@@ -160,18 +217,29 @@ export function writeHotboardConfig(projectRoot, patch) {
     const next = {
         enabled: current.enabled,
         cron: current.cron,
-        source: current.source,
+        sources: current.sources,
         type: current.type,
         limit: current.limit
     }
 
-    for (const key of ['enabled', 'cron', 'source', 'type', 'limit']) {
+    for (const key of ['enabled', 'cron', 'type']) {
         if (key in patch) next[key] = patch[key]
     }
 
     if (typeof next.cron === 'string') next.cron = next.cron.trim()
-    if (typeof next.source === 'string') next.source = next.source.trim()
     if (typeof next.type === 'string') next.type = next.type.trim()
+
+    // `source` (single URL) is accepted as a legacy alias for `sources = [source]`.
+    if ('source' in patch) {
+        const url = typeof patch.source === 'string' ? patch.source.trim() : patch.source
+        next.sources = [url]
+    }
+    if ('sources' in patch) {
+        if (!Array.isArray(patch.sources)) {
+            fail('BAD_REQUEST', '`sources` must be a non-empty array of http(s) URLs.')
+        }
+        next.sources = normalizeSources(patch.sources)
+    }
     if ('limit' in patch) {
         const limit = Number(patch.limit)
         if (!Number.isSafeInteger(limit)) fail('BAD_REQUEST', '`limit` must be an integer between 0 and 500.')
@@ -181,10 +249,11 @@ export function writeHotboardConfig(projectRoot, patch) {
     validateValues(next, 'BAD_REQUEST')
 
     const updatedAt = new Date().toISOString()
-    persistConfigFile(projectRoot, { ...next, updatedAt, lastRun: current.lastRun })
+    persistConfigFile(projectRoot, { ...next, source: next.sources[0], updatedAt, lastRun: current.lastRun })
 
     return {
         ...next,
+        source: next.sources[0],
         timezone: current.timezone,
         updatedAt,
         lastRun: current.lastRun,
@@ -198,7 +267,8 @@ export function recordLastRun(projectRoot, lastRun) {
     persistConfigFile(projectRoot, {
         enabled: current.enabled,
         cron: current.cron,
-        source: current.source,
+        sources: current.sources,
+        source: current.sources[0],
         type: current.type,
         limit: current.limit,
         updatedAt: current.updatedAt,
@@ -250,13 +320,13 @@ export function writeQueryList(projectRoot, titles) {
     return { path: targets[0], written: targets, count: titles.length }
 }
 
-function buildSourceUrl(config) {
-    const url = new URL(config.source)
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-        fail('BAD_REQUEST', '`source` must be an absolute http(s) URL.')
+function buildSourceUrl(url, type) {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        fail('BAD_REQUEST', 'Source must be an absolute http(s) URL.')
     }
-    if (config.type) url.searchParams.set('type', config.type)
-    return url.toString()
+    if (type) parsed.searchParams.set('type', type)
+    return parsed.toString()
 }
 
 function normalizeTitles(list, limit) {
@@ -293,14 +363,15 @@ function describeUpstreamFailure(status, text) {
     return detail ? `Upstream responded ${status}: ${detail}` : `Upstream responded ${status}.`
 }
 
-export async function fetchHotboard(config) {
+async function fetchSource(url, config) {
     const started = Date.now()
-    let url
+    let requestUrl
     try {
-        url = buildSourceUrl(config)
+        requestUrl = buildSourceUrl(url, config.type)
     } catch (err) {
         return {
             ok: false,
+            url,
             httpStatus: null,
             titles: [],
             upstreamUpdateTime: null,
@@ -313,7 +384,7 @@ export async function fetchHotboard(config) {
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
 
     try {
-        const response = await fetch(url, {
+        const response = await fetch(requestUrl, {
             signal: controller.signal,
             headers: { accept: 'application/json', 'user-agent': 'microsoft-rewards-script-control-api' }
         })
@@ -323,6 +394,7 @@ export async function fetchHotboard(config) {
         if (!response.ok) {
             return {
                 ok: false,
+                url,
                 httpStatus: response.status,
                 titles: [],
                 upstreamUpdateTime: null,
@@ -337,6 +409,7 @@ export async function fetchHotboard(config) {
         } catch {
             return {
                 ok: false,
+                url,
                 httpStatus: response.status,
                 titles: [],
                 upstreamUpdateTime: null,
@@ -349,6 +422,7 @@ export async function fetchHotboard(config) {
         if (!list) {
             return {
                 ok: false,
+                url,
                 httpStatus: response.status,
                 titles: [],
                 upstreamUpdateTime: null,
@@ -361,6 +435,7 @@ export async function fetchHotboard(config) {
         if (!titles.length) {
             return {
                 ok: false,
+                url,
                 httpStatus: response.status,
                 titles: [],
                 upstreamUpdateTime: null,
@@ -371,6 +446,7 @@ export async function fetchHotboard(config) {
 
         return {
             ok: true,
+            url,
             httpStatus: response.status,
             titles,
             upstreamUpdateTime: typeof payload.update_time === 'string' ? payload.update_time : null,
@@ -382,6 +458,7 @@ export async function fetchHotboard(config) {
         const aborted = err instanceof Error && err.name === 'AbortError'
         return {
             ok: false,
+            url,
             httpStatus: null,
             titles: [],
             upstreamUpdateTime: null,
@@ -392,6 +469,74 @@ export async function fetchHotboard(config) {
         }
     } finally {
         clearTimeout(timer)
+    }
+}
+
+/**
+ * Fetch the hot board by round-robining through every configured source.
+ * Each refresh starts at the next source in rotation order and falls back to
+ * the following sources until one succeeds (or all fail). Failed URLs are
+ * reported in `failedSources` / `attempts` so they can be identified and replaced.
+ */
+export async function fetchHotboard(config) {
+    const sources =
+        Array.isArray(config.sources) && config.sources.length > 0
+            ? config.sources
+            : typeof config.source === 'string' && config.source.trim()
+              ? [config.source.trim()]
+              : []
+
+    if (!sources.length) {
+        return {
+            ok: false,
+            httpStatus: null,
+            titles: [],
+            upstreamUpdateTime: null,
+            durationMs: 0,
+            error: 'No hot board sources configured.',
+            usedSource: null,
+            failedSources: [],
+            attempts: []
+        }
+    }
+
+    const startIndex = sourceRotationIndex % sources.length
+    sourceRotationIndex = (startIndex + 1) % sources.length
+
+    const attempts = []
+    const failedSources = []
+
+    for (let i = 0; i < sources.length; i++) {
+        const url = sources[(startIndex + i) % sources.length]
+        const attempt = await fetchSource(url, config)
+        attempts.push(attempt)
+        if (attempt.ok) {
+            return {
+                ok: true,
+                httpStatus: attempt.httpStatus,
+                titles: attempt.titles,
+                upstreamUpdateTime: attempt.upstreamUpdateTime,
+                durationMs: attempt.durationMs,
+                error: null,
+                usedSource: url,
+                failedSources,
+                attempts
+            }
+        }
+        failedSources.push(url)
+    }
+
+    const last = attempts[attempts.length - 1]
+    return {
+        ok: false,
+        httpStatus: last?.httpStatus ?? null,
+        titles: [],
+        upstreamUpdateTime: null,
+        durationMs: attempts.reduce((sum, attempt) => sum + attempt.durationMs, 0),
+        error: last?.error ?? 'All hot board sources failed.',
+        usedSource: null,
+        failedSources,
+        attempts
     }
 }
 
@@ -424,6 +569,8 @@ export async function runHotboardRefresh(projectRoot, { trigger = 'manual', dryR
         count: result.titles.length,
         written: written.length,
         upstreamUpdateTime: result.upstreamUpdateTime,
+        usedSource: result.usedSource,
+        failedSources: result.failedSources ?? [],
         error,
         titles: result.titles.slice(0, MAX_TITLES_IN_STATE)
     }
@@ -442,6 +589,9 @@ export async function runHotboardRefresh(projectRoot, { trigger = 'manual', dryR
         httpStatus: result.httpStatus,
         durationMs: result.durationMs,
         upstreamUpdateTime: result.upstreamUpdateTime,
+        usedSource: result.usedSource,
+        failedSources: result.failedSources ?? [],
+        attempts: result.attempts ?? [],
         titles: result.titles,
         written,
         dryRun,
@@ -568,10 +718,17 @@ export function createHotboardScheduler(projectRoot, { log = () => {}, intervalM
         running = true
         try {
             const result = await runHotboardRefresh(projectRoot, { trigger })
+            for (const attempt of result.attempts ?? []) {
+                if (!attempt.ok) {
+                    log('warn', `Hot board source failed: ${attempt.url} | ${attempt.error}`)
+                }
+            }
             if (result.ok) {
                 log(
                     'info',
-                    `Hot board refreshed (${trigger}): ${result.titles.length} titles written to ${result.written.length} file(s).`
+                    `Hot board refreshed (${trigger}): ${result.titles.length} titles from ${
+                        result.usedSource ?? 'unknown'
+                    } written to ${result.written.length} file(s).`
                 )
             } else {
                 log('warn', `Hot board refresh failed (${trigger}): ${result.error}`)
@@ -640,4 +797,13 @@ export function createHotboardScheduler(projectRoot, { log = () => {}, intervalM
     }
 }
 
-export { DEFAULT_CRON, DEFAULT_SOURCE, DEFAULT_TYPE, MAX_LIMIT, SUPPORTED_TYPES, QUERY_FILE }
+export {
+    DEFAULT_CRON,
+    DEFAULT_SOURCE,
+    DEFAULT_SOURCES,
+    DEFAULT_TYPE,
+    MAX_LIMIT,
+    MAX_SOURCES,
+    SUPPORTED_TYPES,
+    QUERY_FILE
+}
