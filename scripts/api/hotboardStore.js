@@ -4,11 +4,10 @@ import path from 'node:path'
 import { isValidCron } from './scheduleStore.js'
 
 const QUERY_FILE = 'search-queries.json'
-const DEFAULT_SOURCE = 'https://uapis.cn/api/v1/misc/hotboard'
+// Sources are full request URLs, used verbatim (query string included).
+const DEFAULT_SOURCE = 'https://uapis.cn/api/v1/misc/hotboard?type=baidu'
 const DEFAULT_SOURCES = [DEFAULT_SOURCE]
 const DEFAULT_CRON = '0 6 * * *'
-const DEFAULT_TYPE = 'baidu'
-const SUPPORTED_TYPES = ['baidu', 'weibo', 'zhihu', 'douyin', 'bilibili', 'toutiao']
 const MAX_LIMIT = 500
 const MAX_TITLES_IN_STATE = 100
 const MAX_MESSAGE_LENGTH = 300
@@ -16,10 +15,25 @@ const MAX_SOURCES = 10
 const FETCH_TIMEOUT_MS = 15_000
 const SCHEDULER_INTERVAL_MS = 20_000
 const MAX_SCAN_MINUTES = 7 * 24 * 60
-const TYPE_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/i
 
-// Round-robin pointer over the configured sources; advances by one after every refresh.
-let sourceRotationIndex = 0
+// Response-shape compatibility: the item array may live under several keys
+// (top-level `list` / `data`, nested `data.list`, ...) and the title under
+// several item keys. The first matching key wins.
+const LIST_PATHS = ['list', 'data', 'items', 'result', 'records', 'results', 'data.list', 'data.items']
+const TITLE_KEYS = [
+    'title',
+    'word',
+    'name',
+    'hotword',
+    'hotWord',
+    'keyword',
+    'searchWord',
+    'query',
+    'content',
+    'value',
+    'text',
+    'note'
+]
 
 const CRON_FIELD_RANGES = [
     { min: 0, max: 59 }, // minute
@@ -73,7 +87,6 @@ function defaultsFromEnv() {
         enabled: true,
         cron: (process.env.HOTBOARD_CRON || DEFAULT_CRON).trim(),
         sources: sources.length ? sources : [DEFAULT_SOURCE],
-        type: (process.env.HOTBOARD_TYPE || DEFAULT_TYPE).trim(),
         limit: Number.isSafeInteger(limit) ? limit : 0
     }
 }
@@ -116,9 +129,6 @@ function validateValues(values, code) {
     for (const url of values.sources) {
         if (!isValidSource(url)) fail(code, `Invalid source URL: ${url}.`)
     }
-    if (typeof values.type !== 'string' || !TYPE_PATTERN.test(values.type.trim())) {
-        fail(code, '`type` must be a source identifier such as "baidu".')
-    }
     if (!Number.isSafeInteger(values.limit) || values.limit < 0 || values.limit > MAX_LIMIT) {
         fail(code, `\`limit\` must be an integer between 0 and ${MAX_LIMIT}.`)
     }
@@ -141,6 +151,9 @@ function normalizeLastRun(value) {
         written: Number.isSafeInteger(value.written) ? value.written : 0,
         upstreamUpdateTime: typeof value.upstreamUpdateTime === 'string' ? value.upstreamUpdateTime : null,
         usedSource: typeof value.usedSource === 'string' ? value.usedSource : null,
+        usedSources: Array.isArray(value.usedSources)
+            ? value.usedSources.filter(url => typeof url === 'string').slice(0, MAX_SOURCES)
+            : [],
         failedSources: Array.isArray(value.failedSources)
             ? value.failedSources.filter(url => typeof url === 'string').slice(0, MAX_SOURCES)
             : [],
@@ -181,7 +194,6 @@ export function readHotboardConfig(projectRoot) {
         enabled: saved.enabled === undefined ? base.enabled : saved.enabled,
         cron: saved.cron === undefined ? base.cron : saved.cron,
         sources,
-        type: saved.type === undefined ? base.type : saved.type,
         limit: saved.limit === undefined ? base.limit : saved.limit
     }
     validateValues(values, 'CORRUPT_HOTBOARD')
@@ -218,16 +230,14 @@ export function writeHotboardConfig(projectRoot, patch) {
         enabled: current.enabled,
         cron: current.cron,
         sources: current.sources,
-        type: current.type,
         limit: current.limit
     }
 
-    for (const key of ['enabled', 'cron', 'type']) {
+    for (const key of ['enabled', 'cron']) {
         if (key in patch) next[key] = patch[key]
     }
 
     if (typeof next.cron === 'string') next.cron = next.cron.trim()
-    if (typeof next.type === 'string') next.type = next.type.trim()
 
     // `source` (single URL) is accepted as a legacy alias for `sources = [source]`.
     if ('source' in patch) {
@@ -269,7 +279,6 @@ export function recordLastRun(projectRoot, lastRun) {
         cron: current.cron,
         sources: current.sources,
         source: current.sources[0],
-        type: current.type,
         limit: current.limit,
         updatedAt: current.updatedAt,
         lastRun: normalizeLastRun(lastRun)
@@ -320,13 +329,42 @@ export function writeQueryList(projectRoot, titles) {
     return { path: targets[0], written: targets, count: titles.length }
 }
 
-function buildSourceUrl(url, type) {
+function buildSourceUrl(url) {
     const parsed = new URL(url)
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
         fail('BAD_REQUEST', 'Source must be an absolute http(s) URL.')
     }
-    if (type) parsed.searchParams.set('type', type)
+    // The configured URL is used verbatim, including its query string.
     return parsed.toString()
+}
+
+function getPath(object, dotted) {
+    let value = object
+    for (const part of dotted.split('.')) {
+        if (value == null || typeof value !== 'object') return undefined
+        value = value[part]
+    }
+    return value
+}
+
+function extractList(payload) {
+    if (Array.isArray(payload)) return payload
+    if (!payload || typeof payload !== 'object') return null
+    for (const key of LIST_PATHS) {
+        const value = getPath(payload, key)
+        if (Array.isArray(value)) return value
+    }
+    return null
+}
+
+function extractTitle(item) {
+    if (typeof item === 'string') return item
+    if (!item || typeof item !== 'object') return null
+    for (const key of TITLE_KEYS) {
+        const value = item[key]
+        if (typeof value === 'string' && value.trim()) return value
+    }
+    return null
 }
 
 function normalizeTitles(list, limit) {
@@ -334,7 +372,7 @@ function normalizeTitles(list, limit) {
     const titles = []
 
     for (const item of list) {
-        const raw = item && typeof item === 'object' ? item.title : undefined
+        const raw = extractTitle(item)
         const title = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : ''
         if (!title) continue
 
@@ -363,17 +401,18 @@ function describeUpstreamFailure(status, text) {
     return detail ? `Upstream responded ${status}: ${detail}` : `Upstream responded ${status}.`
 }
 
-async function fetchSource(url, config) {
+async function fetchSource(url) {
     const started = Date.now()
     let requestUrl
     try {
-        requestUrl = buildSourceUrl(url, config.type)
+        requestUrl = buildSourceUrl(url)
     } catch (err) {
         return {
             ok: false,
             url,
             httpStatus: null,
             titles: [],
+            count: 0,
             upstreamUpdateTime: null,
             durationMs: 0,
             error: clampMessage(err instanceof Error ? err.message : err)
@@ -397,6 +436,7 @@ async function fetchSource(url, config) {
                 url,
                 httpStatus: response.status,
                 titles: [],
+                count: 0,
                 upstreamUpdateTime: null,
                 durationMs,
                 error: describeUpstreamFailure(response.status, text)
@@ -412,26 +452,30 @@ async function fetchSource(url, config) {
                 url,
                 httpStatus: response.status,
                 titles: [],
+                count: 0,
                 upstreamUpdateTime: null,
                 durationMs,
                 error: 'Upstream returned a non-JSON body.'
             }
         }
 
-        const list = payload && Array.isArray(payload.list) ? payload.list : null
+        const list = extractList(payload)
         if (!list) {
             return {
                 ok: false,
                 url,
                 httpStatus: response.status,
                 titles: [],
+                count: 0,
                 upstreamUpdateTime: null,
                 durationMs,
-                error: 'Upstream response has no `list` array.'
+                error: 'Upstream response has no array of items (list, data, items, ...).'
             }
         }
 
-        const titles = normalizeTitles(list, config.limit)
+        // No per-source truncation here: sources are merged (and the global
+        // `limit` applied) inside fetchHotboard.
+        const titles = normalizeTitles(list, 0)
         if (!titles.length) {
             return {
                 ok: false,
@@ -449,6 +493,7 @@ async function fetchSource(url, config) {
             url,
             httpStatus: response.status,
             titles,
+            count: titles.length,
             upstreamUpdateTime: typeof payload.update_time === 'string' ? payload.update_time : null,
             durationMs,
             error: null
@@ -461,6 +506,7 @@ async function fetchSource(url, config) {
             url,
             httpStatus: null,
             titles: [],
+            count: 0,
             upstreamUpdateTime: null,
             durationMs,
             error: aborted
@@ -473,10 +519,10 @@ async function fetchSource(url, config) {
 }
 
 /**
- * Fetch the hot board by round-robining through every configured source.
- * Each refresh starts at the next source in rotation order and falls back to
- * the following sources until one succeeds (or all fail). Failed URLs are
- * reported in `failedSources` / `attempts` so they can be identified and replaced.
+ * Fetch the hot board by requesting EVERY configured source in parallel and
+ * merging their titles (deduplicated, in source order) into one list. A source
+ * that fails is reported in `failedSources` / `attempts` but does not stop the
+ * others. `limit` (when > 0) caps the merged list.
  */
 export async function fetchHotboard(config) {
     const sources =
@@ -495,46 +541,61 @@ export async function fetchHotboard(config) {
             durationMs: 0,
             error: 'No hot board sources configured.',
             usedSource: null,
+            usedSources: [],
             failedSources: [],
             attempts: []
         }
     }
 
-    const startIndex = sourceRotationIndex % sources.length
-    sourceRotationIndex = (startIndex + 1) % sources.length
+    const attempts = await Promise.all(sources.map(url => fetchSource(url)))
+    const successful = attempts.filter(attempt => attempt.ok)
+    const failedSources = attempts.filter(attempt => !attempt.ok).map(attempt => attempt.url)
 
-    const attempts = []
-    const failedSources = []
-
-    for (let i = 0; i < sources.length; i++) {
-        const url = sources[(startIndex + i) % sources.length]
-        const attempt = await fetchSource(url, config)
-        attempts.push(attempt)
-        if (attempt.ok) {
-            return {
-                ok: true,
-                httpStatus: attempt.httpStatus,
-                titles: attempt.titles,
-                upstreamUpdateTime: attempt.upstreamUpdateTime,
-                durationMs: attempt.durationMs,
-                error: null,
-                usedSource: url,
-                failedSources,
-                attempts
-            }
+    const seen = new Set()
+    const titles = []
+    const limit = config.limit > 0 ? config.limit : Infinity
+    for (const attempt of successful) {
+        for (const title of attempt.titles) {
+            const key = title.toLowerCase()
+            if (seen.has(key)) continue
+            seen.add(key)
+            titles.push(title)
+            if (titles.length >= limit) break
         }
-        failedSources.push(url)
+        if (titles.length >= limit) break
     }
 
     const last = attempts[attempts.length - 1]
+    const durationMs = attempts.reduce((max, attempt) => Math.max(max, attempt.durationMs), 0)
+    const upstreamUpdateTime = successful.reduce((latest, attempt) => {
+        if (!attempt.upstreamUpdateTime) return latest
+        return !latest || attempt.upstreamUpdateTime > latest ? attempt.upstreamUpdateTime : latest
+    }, null)
+
+    if (!successful.length) {
+        return {
+            ok: false,
+            httpStatus: last?.httpStatus ?? null,
+            titles: [],
+            upstreamUpdateTime: null,
+            durationMs,
+            error: last?.error ?? 'All hot board sources failed.',
+            usedSource: null,
+            usedSources: [],
+            failedSources,
+            attempts
+        }
+    }
+
     return {
-        ok: false,
+        ok: true,
         httpStatus: last?.httpStatus ?? null,
-        titles: [],
-        upstreamUpdateTime: null,
-        durationMs: attempts.reduce((sum, attempt) => sum + attempt.durationMs, 0),
-        error: last?.error ?? 'All hot board sources failed.',
-        usedSource: null,
+        titles,
+        upstreamUpdateTime,
+        durationMs,
+        error: null,
+        usedSource: successful[0].url,
+        usedSources: successful.map(attempt => attempt.url),
         failedSources,
         attempts
     }
@@ -570,6 +631,7 @@ export async function runHotboardRefresh(projectRoot, { trigger = 'manual', dryR
         written: written.length,
         upstreamUpdateTime: result.upstreamUpdateTime,
         usedSource: result.usedSource,
+        usedSources: result.usedSources ?? [],
         failedSources: result.failedSources ?? [],
         error,
         titles: result.titles.slice(0, MAX_TITLES_IN_STATE)
@@ -590,6 +652,7 @@ export async function runHotboardRefresh(projectRoot, { trigger = 'manual', dryR
         durationMs: result.durationMs,
         upstreamUpdateTime: result.upstreamUpdateTime,
         usedSource: result.usedSource,
+        usedSources: result.usedSources ?? [],
         failedSources: result.failedSources ?? [],
         attempts: result.attempts ?? [],
         titles: result.titles,
@@ -702,7 +765,6 @@ export function getHotboardStatus(projectRoot) {
         ...config,
         nextRunAt: config.enabled ? nextRunAt(config.cron, { timeZone: config.timezone }) : null,
         queryFile: readActiveQueryList(projectRoot),
-        supportedTypes: SUPPORTED_TYPES,
         limits: { maxLimit: MAX_LIMIT, maxTitlesInState: MAX_TITLES_IN_STATE }
     }
 }
@@ -724,11 +786,12 @@ export function createHotboardScheduler(projectRoot, { log = () => {}, intervalM
                 }
             }
             if (result.ok) {
+                const sources = result.usedSources?.length
+                    ? result.usedSources.join(', ')
+                    : (result.usedSource ?? 'unknown')
                 log(
                     'info',
-                    `Hot board refreshed (${trigger}): ${result.titles.length} titles from ${
-                        result.usedSource ?? 'unknown'
-                    } written to ${result.written.length} file(s).`
+                    `Hot board refreshed (${trigger}): ${result.titles.length} titles from ${result.usedSources?.length ?? 1} source(s) [${sources}] written to ${result.written.length} file(s).`
                 )
             } else {
                 log('warn', `Hot board refresh failed (${trigger}): ${result.error}`)
@@ -797,13 +860,4 @@ export function createHotboardScheduler(projectRoot, { log = () => {}, intervalM
     }
 }
 
-export {
-    DEFAULT_CRON,
-    DEFAULT_SOURCE,
-    DEFAULT_SOURCES,
-    DEFAULT_TYPE,
-    MAX_LIMIT,
-    MAX_SOURCES,
-    SUPPORTED_TYPES,
-    QUERY_FILE
-}
+export { DEFAULT_CRON, DEFAULT_SOURCE, DEFAULT_SOURCES, MAX_LIMIT, MAX_SOURCES, QUERY_FILE }

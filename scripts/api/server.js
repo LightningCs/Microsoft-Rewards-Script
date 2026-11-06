@@ -16,7 +16,6 @@ import {
 } from './configEditor.js'
 import { readSchedule, writeSchedule } from './scheduleStore.js'
 import {
-    SUPPORTED_TYPES,
     createHotboardScheduler,
     getHotboardStatus,
     nextRunAt,
@@ -303,9 +302,7 @@ function sourceView(config) {
     return {
         sources: config.sources,
         source: config.sources[0] ?? null, // legacy single-URL alias
-        type: config.type,
         limit: config.limit,
-        supportedTypes: SUPPORTED_TYPES,
         origin: config.origin,
         updatedAt: config.updatedAt,
         writable: ALLOW_HOTBOARD_WRITE
@@ -674,6 +671,7 @@ const requestHandler = async (req, res) => {
                     count: result.titles.length,
                     upstreamUpdateTime: result.upstreamUpdateTime,
                     usedSource: result.usedSource,
+                    usedSources: result.usedSources ?? [],
                     failedSources: result.failedSources ?? [],
                     written: result.written,
                     lastRun: result.lastRun
@@ -682,11 +680,14 @@ const requestHandler = async (req, res) => {
                     pm.note('warn', `Manual hot board refresh failed: ${result.error}`)
                     return sendJson(res, 502, payload)
                 }
+                const sources = result.usedSources?.length
+                    ? result.usedSources.join(', ')
+                    : (result.usedSource ?? 'unknown')
                 pm.note(
                     'info',
                     dryRun
-                        ? `Hot board refresh (dry run) fetched ${result.titles.length} titles from ${result.usedSource ?? 'unknown'}.`
-                        : `Hot board refreshed manually: ${result.titles.length} titles from ${result.usedSource ?? 'unknown'} written to ${result.written.length} file(s).`
+                        ? `Hot board refresh (dry run) fetched ${result.titles.length} titles from ${result.usedSources?.length ?? 1} source(s) [${sources}].`
+                        : `Hot board refreshed manually: ${result.titles.length} titles from ${result.usedSources?.length ?? 1} source(s) [${sources}] written to ${result.written.length} file(s).`
                 )
                 return sendJson(res, 200, payload)
             } catch (err) {
@@ -747,13 +748,13 @@ const requestHandler = async (req, res) => {
             }
             const body = await readJsonObject(req)
             try {
-                const patch = pickFields(body, ['sources', 'source', 'type', 'limit'], 'PUT/PATCH /hotboard/source')
+                const patch = pickFields(body, ['sources', 'source', 'limit'], 'PUT/PATCH /hotboard/source')
                 const updated = writeHotboardConfig(projectRoot, patch)
                 pm.note(
                     'info',
-                    `Hot board sources updated via API (${method}): ${updated.sources.join(', ')} (type ${
-                        updated.type
-                    }, limit ${updated.limit || 'all'}).`
+                    `Hot board sources updated via API (${method}): ${updated.sources.join(', ')} (limit ${
+                        updated.limit || 'all'
+                    }).`
                 )
                 return sendJson(res, 200, sourceView(updated))
             } catch (err) {
@@ -996,7 +997,7 @@ function startHotboardScheduler() {
         const config = readHotboardConfig(projectRoot)
         log(
             'INFO',
-            `Hot board: ${config.enabled ? `enabled (${config.cron}, TZ ${config.timezone})` : 'disabled'} | source: ${config.type} @ ${
+            `Hot board: ${config.enabled ? `enabled (${config.cron}, TZ ${config.timezone})` : 'disabled'} | sources: ${
                 config.sources?.join(', ') ?? 'none'
             } | writes: ${ALLOW_HOTBOARD_WRITE ? 'on' : 'off'}`
         )

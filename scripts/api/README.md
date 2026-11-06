@@ -430,7 +430,7 @@ server itself remains dependency-free.
 | `GET`  | `/schedule`                     | Read the effective cron schedule and its source.                  |
 | `GET`  | `/hotboard`                     | Read the hot board configuration, state, and last refresh.        |
 | `GET`  | `/hotboard/schedule`            | Read the hot board refresh cron expression.                       |
-| `GET`  | `/hotboard/source`              | Read the hot board provider URL, board type, and title limit.     |
+| `GET`  | `/hotboard/source`              | Read the hot board provider URLs, board type, and title limit.    |
 | `GET`  | `/events`                       | SSE stream containing live logs and status updates.               |
 
 ### Control and write endpoints
@@ -1934,9 +1934,25 @@ A failed refresh never modifies the live list: the previous contents stay in
 place, the error is stored with the last run, and the next scheduled or manual
 attempt retries. `POST /hotboard/refresh` exists exactly for that case.
 
-[`hotboard-api.md`](./hotboard-api.md) is a condensed, code-generation friendly
-reference for these endpoints: TypeScript definitions, validation rules, and the
-complete status-code matrix.
+Several provider URLs can be configured (`sources`). Every refresh requests
+**all** of them in parallel, merges their titles into one deduplicated list (in
+source order) and saves the union — a failing source does not stop the others.
+The URLs that failed are listed in `lastRun.failedSources` and logged by the API
+process, so a dead provider can be spotted and replaced without stopping the
+feature.
+
+Each source URL is used verbatim — paste the full request path, including any
+query string (for example `https://uapis.cn/api/v1/misc/hotboard?type=baidu`).
+No parameter is appended by the client. Response parsing tolerates different
+provider shapes (item arrays under `list` / `data` / `items` / ..., titles under
+`title` / `word` / `name` / ...), so different APIs can be plugged in without
+extra configuration.
+
+[`docs/hotboard-api.md`](../../docs/hotboard-api.md) is a condensed,
+code-generation friendly reference (written in Chinese) for these endpoints:
+TypeScript definitions, validation rules, per-endpoint status matrices,
+aggregation semantics, and a typed client sketch. Interface documentation
+lives in the top-level [`docs/`](../../docs/) directory.
 
 ### `GET /hotboard`
 
@@ -1962,8 +1978,7 @@ console.log(data)
 {
     "enabled": true,
     "cron": "0 6 * * *",
-    "source": "https://uapis.cn/api/v1/misc/hotboard",
-    "type": "baidu",
+    "sources": ["https://uapis.cn/api/v1/misc/hotboard?type=baidu", "https://backup.example/hotboard"],
     "limit": 0,
     "timezone": "Europe/Amsterdam",
     "updatedAt": "2026-10-19T04:00:02.000Z",
@@ -1976,7 +1991,6 @@ console.log(data)
         "count": 50,
         "updatedAt": "2026-10-19T04:00:02.512Z"
     },
-    "supportedTypes": ["baidu", "weibo", "zhihu", "douyin", "bilibili", "toutiao"],
     "limits": { "maxLimit": 500, "maxTitlesInState": 100 },
     "lastRun": {
         "at": "2026-10-19T04:00:02.400Z",
@@ -1987,6 +2001,9 @@ console.log(data)
         "count": 50,
         "written": 2,
         "upstreamUpdateTime": "2026-10-19T03:58:00.000Z",
+        "usedSource": "https://uapis.cn/api/v1/misc/hotboard?type=baidu",
+        "usedSources": ["https://uapis.cn/api/v1/misc/hotboard?type=baidu"],
+        "failedSources": [],
         "error": null,
         "titles": ["第一条热搜标题", "第二条热搜标题"]
     }
@@ -1996,18 +2013,20 @@ console.log(data)
 Fields:
 
 - `enabled` / `cron` / `timezone`: the daily refresh schedule, evaluated in `TZ`;
-- `source` / `type` / `limit`: the provider URL, the `type` query parameter sent
-  with it, and the maximum number of titles kept (`0` keeps every title);
+- `sources` / `limit`: the provider URLs fetched on every refresh (used verbatim,
+  including any query string), and the maximum number of titles kept after the
+  merge (`0` keeps every title);
 - `origin`: `env` when the values still come from `HOTBOARD_*`, `override` after
   `config/hotboard.json` has been written;
 - `nextRunAt`: the next scheduled refresh within the coming seven days, or `null`
   when nothing matches in that window;
 - `writable`: whether `API_ALLOW_HOTBOARD_WRITE=true` is active;
 - `queryFile`: the live list currently read by the bot, with its entry count;
-- `supportedTypes`: known provider boards, offered as dropdown suggestions;
 - `lastRun`: `trigger` is `schedule`, `manual`, or `startup`; `count` is the
-  number of titles fetched, `written` the number of files written; `titles` keeps
-  a sample of the last result.
+  number of merged titles, `written` the number of files written;
+  `usedSources` lists every URL that produced titles (their union is saved),
+  `usedSource` its first entry for display, `failedSources` the URLs that failed
+  during that refresh; `titles` keeps a sample of the last result.
 
 ### `POST /hotboard/refresh`
 
@@ -2058,6 +2077,9 @@ console.log(data.ok, data.count, data.written)
     "dryRun": false,
     "count": 50,
     "upstreamUpdateTime": "2026-10-19T03:58:00.000Z",
+    "usedSource": "https://uapis.cn/api/v1/misc/hotboard?type=baidu",
+    "usedSources": ["https://uapis.cn/api/v1/misc/hotboard?type=baidu"],
+    "failedSources": [],
     "written": [
         "/opt/microsoft-rewards-script/src/functions/search-queries.json",
         "/opt/microsoft-rewards-script/dist/functions/search-queries.json"
@@ -2071,6 +2093,9 @@ console.log(data.ok, data.count, data.written)
         "count": 50,
         "written": 2,
         "upstreamUpdateTime": "2026-10-19T03:58:00.000Z",
+        "usedSource": "https://uapis.cn/api/v1/misc/hotboard?type=baidu",
+        "usedSources": ["https://uapis.cn/api/v1/misc/hotboard?type=baidu"],
+        "failedSources": [],
         "error": null,
         "titles": ["第一条热搜标题", "第二条热搜标题"]
     }
@@ -2078,35 +2103,81 @@ console.log(data.ok, data.count, data.written)
 ```
 
 A provider failure returns `502 Bad Gateway` with the same body shape and
-`ok: false`, plus a readable `error`, for example:
+`ok: false`, plus a readable `error`. Every configured source is requested, so
+when some fail but others succeed the response is still `ok: true` and
+`failedSources` lists the URLs that failed while `usedSources` lists the ones
+that contributed titles, for example:
+
+```json
+{
+    "ok": true,
+    "error": null,
+    "httpStatus": 200,
+    "durationMs": 812,
+    "dryRun": false,
+    "count": 50,
+    "upstreamUpdateTime": "2026-10-19T03:58:00.000Z",
+    "usedSource": "https://backup.example/hotboard",
+    "usedSources": ["https://backup.example/hotboard"],
+    "failedSources": ["https://uapis.cn/api/v1/misc/hotboard?type=baidu"],
+    "written": 2,
+    "lastRun": {
+        "at": "2026-10-19T04:05:00.000Z",
+        "ok": true,
+        "trigger": "manual",
+        "httpStatus": 200,
+        "durationMs": 812,
+        "count": 50,
+        "written": 2,
+        "upstreamUpdateTime": "2026-10-19T03:58:00.000Z",
+        "usedSource": "https://backup.example/hotboard",
+        "usedSources": ["https://backup.example/hotboard"],
+        "failedSources": ["https://uapis.cn/api/v1/misc/hotboard?type=baidu"],
+        "error": null,
+        "titles": ["第一条热搜标题", "第二条热搜标题"]
+    }
+}
+```
+
+When every source fails the response is `ok: false` with `failedSources`
+containing all configured URLs and `error` carrying the last failure, for
+example:
 
 ```json
 {
     "ok": false,
-    "error": "Upstream responded 400: type is invalid",
-    "httpStatus": 400,
+    "error": "Upstream responded 503: service unavailable",
+    "httpStatus": 503,
     "durationMs": 212,
     "dryRun": false,
     "count": 0,
     "upstreamUpdateTime": null,
+    "usedSource": null,
+    "usedSources": [],
+    "failedSources": ["https://uapis.cn/api/v1/misc/hotboard?type=baidu"],
     "written": [],
     "lastRun": {
         "at": "2026-10-19T04:05:00.000Z",
         "ok": false,
         "trigger": "manual",
-        "httpStatus": 400,
+        "httpStatus": 503,
         "durationMs": 212,
         "count": 0,
         "written": 0,
         "upstreamUpdateTime": null,
-        "error": "Upstream responded 400: type is invalid",
+        "usedSource": null,
+        "usedSources": [],
+        "failedSources": ["https://uapis.cn/api/v1/misc/hotboard?type=baidu"],
+        "error": "Upstream responded 503: service unavailable",
         "titles": []
     }
 }
 ```
 
 The live list is untouched by a failed refresh, so the dashboard can show the
-error and offer the button again.
+error and offer the button again. Failed URLs are also logged with their error
+message by the API process, which is what lets you spot and replace a dead
+provider.
 
 ### `GET /hotboard/schedule` and `PUT|PATCH /hotboard/schedule`
 
@@ -2159,7 +2230,8 @@ Disabling the schedule keeps the current query list and the manual
 
 ### `GET /hotboard/source` and `PUT|PATCH /hotboard/source`
 
-Read and change the provider. The request is `source` + `?type=<type>`.
+Read and change the provider list. Every configured URL is a full request path
+used verbatim (including any query string); nothing is appended by the client.
 
 ```bash
 curl --request GET \
@@ -2169,10 +2241,9 @@ curl --request GET \
 
 ```json
 {
-    "source": "https://uapis.cn/api/v1/misc/hotboard",
-    "type": "baidu",
+    "sources": ["https://uapis.cn/api/v1/misc/hotboard?type=baidu", "https://backup.example/hotboard"],
+    "source": "https://uapis.cn/api/v1/misc/hotboard?type=baidu",
     "limit": 0,
-    "supportedTypes": ["baidu", "weibo", "zhihu", "douyin", "bilibili", "toutiao"],
     "origin": "override",
     "updatedAt": "2026-10-19T04:00:02.000Z",
     "writable": true
@@ -2184,19 +2255,23 @@ curl --request PATCH \
   --url http://127.0.0.1:3010/hotboard/source \
   --header 'Authorization: Bearer YOUR_API_TOKEN' \
   --header 'Content-Type: application/json' \
-  --data '{"source":"https://uapis.cn/api/v1/misc/hotboard","type":"weibo","limit":30}'
+  --data '{"sources":["https://uapis.cn/api/v1/misc/hotboard?type=baidu","https://backup.example/hotboard"],"limit":30}'
 ```
 
 Supported body fields:
 
-| Field    | Type    | Description                                                                      |
-| -------- | ------- | -------------------------------------------------------------------------------- |
-| `source` | string  | Absolute `http(s)` URL of the provider endpoint.                                 |
-| `type`   | string  | Board identifier sent as `?type=`, up to 32 characters (`[a-z0-9_-]`).           |
-| `limit`  | integer | Titles kept per refresh, `0`..`500`. `0` keeps every title the provider returns. |
+| Field     | Type     | Description                                                                                        |
+| --------- | -------- | -------------------------------------------------------------------------------------------------- |
+| `sources` | string[] | Absolute `http(s)` full request URLs, `1`..`10` entries. Empty strings and duplicates are dropped. |
+| `source`  | string   | Legacy single-URL alias: sets `sources = ["<url>"]`.                                               |
+| `limit`   | integer  | Titles kept per refresh, `0`..`500`. `0` keeps every title the provider returns.                   |
 
-`supportedTypes` lists the boards the dashboard may offer as suggestions; any
-other identifier is accepted so a different provider can be plugged in.
+`sources` replaces the whole list; `source` is kept for compatibility with older
+clients and writes a one-entry list. Response parsing tolerates different
+provider shapes: the item array may live under `list`, `data`, `items`,
+`result`, ... (including nested `data.list`) and the title under `title`,
+`word`, `name`, `hotword`, ... — see
+[`docs/hotboard-api.md`](../../docs/hotboard-api.md#返回值结构兼容).
 
 When writes are disabled, `PUT` and `PATCH` return `403 Forbidden`. Invalid
 values return `400 Bad Request`, an unreadable `config/hotboard.json` returns
@@ -2314,32 +2389,32 @@ Most errors use this shape:
 
 All variables are optional.
 
-| Variable                   | Default                       | Purpose                                                                                     |
-| -------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------- |
-| `API_HOST`                 | `127.0.0.1`                   | Interface to bind. Use `0.0.0.0` only when remote/container access is required.             |
-| `API_PORT`                 | `3010`                        | HTTP listen port.                                                                           |
-| `API_TOKEN`                | unset                         | Shared token required by every endpoint when configured.                                    |
-| `API_CORS_ORIGIN`          | `*`                           | Value returned in `Access-Control-Allow-Origin`.                                            |
-| `API_LOG_BUFFER`           | `2000`                        | Maximum structured log entries kept in memory.                                              |
-| `API_RUN_HISTORY`          | `20`                          | Maximum completed runs kept in memory.                                                      |
-| `API_STOP_TIMEOUT_MS`      | `15000`                       | Graceful-stop window before forced termination.                                             |
-| `API_RUN_COMMAND`          | auto                          | Override the executable used to launch the bot.                                             |
-| `API_RUN_ARGS`             | none                          | Default arguments for `API_RUN_COMMAND`; accepts whitespace-separated text or a JSON array. |
-| `API_DIAGNOSTICS_DIR`      | `<repo>/diagnostics`          | Read-only diagnostics directory.                                                            |
-| `API_ALLOW_CONFIG_WRITE`   | `false`                       | Permit `PUT` and `PATCH /config`.                                                           |
-| `API_ALLOW_HOTBOARD_WRITE` | `false`                       | Permit `POST /hotboard/refresh` and the `/hotboard/*` writes.                               |
-| `API_ALLOW_SCHEDULE_WRITE` | `false`                       | Permit `PUT` and `PATCH /schedule`.                                                         |
-| `API_ALLOW_ENV_OVERRIDES`  | `false`                       | Permit arbitrary `env` fields in `/start` and `/restart`.                                   |
-| `API_ALLOW_CONFIG_REVEAL`  | `false`                       | Permit authenticated `GET /config?reveal=1`.                                                |
-| `API_VALIDATOR_MODULE`     | auto                          | Path to a compiled module exporting `validateConfig` or `ConfigSchema`.                     |
-| `SCHEDULE_FILE`            | `<repo>/config/schedule.json` | Override the persisted schedule file path.                                                  |
-| `CRON_SCHEDULE`            | unset                         | Base schedule reported and used when no persisted schedule override exists.                 |
-| `HOTBOARD_FILE`            | `<repo>/config/hotboard.json` | Override the persisted hot board configuration file path.                                   |
-| `HOTBOARD_CRON`            | `0 6 * * *`                   | Default hot board refresh cron while no `hotboard.json` exists.                             |
-| `HOTBOARD_SOURCE`          | `uapis.cn` hot board endpoint | Default hot board provider URL while no `hotboard.json` exists.                             |
-| `HOTBOARD_TYPE`            | `baidu`                       | Default provider board sent as `?type=` while no `hotboard.json` exists.                    |
-| `HOTBOARD_LIMIT`           | `0`                           | Default number of titles kept per refresh, `0` for every title.                             |
-| `TZ`                       | `UTC`                         | Timezone used by cron and returned by `/schedule` and `/hotboard`.                          |
+| Variable                   | Default                       | Purpose                                                                                                                                                 |
+| -------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `API_HOST`                 | `127.0.0.1`                   | Interface to bind. Use `0.0.0.0` only when remote/container access is required.                                                                         |
+| `API_PORT`                 | `3010`                        | HTTP listen port.                                                                                                                                       |
+| `API_TOKEN`                | unset                         | Shared token required by every endpoint when configured.                                                                                                |
+| `API_CORS_ORIGIN`          | `*`                           | Value returned in `Access-Control-Allow-Origin`.                                                                                                        |
+| `API_LOG_BUFFER`           | `2000`                        | Maximum structured log entries kept in memory.                                                                                                          |
+| `API_RUN_HISTORY`          | `20`                          | Maximum completed runs kept in memory.                                                                                                                  |
+| `API_STOP_TIMEOUT_MS`      | `15000`                       | Graceful-stop window before forced termination.                                                                                                         |
+| `API_RUN_COMMAND`          | auto                          | Override the executable used to launch the bot.                                                                                                         |
+| `API_RUN_ARGS`             | none                          | Default arguments for `API_RUN_COMMAND`; accepts whitespace-separated text or a JSON array.                                                             |
+| `API_DIAGNOSTICS_DIR`      | `<repo>/diagnostics`          | Read-only diagnostics directory.                                                                                                                        |
+| `API_ALLOW_CONFIG_WRITE`   | `false`                       | Permit `PUT` and `PATCH /config`.                                                                                                                       |
+| `API_ALLOW_HOTBOARD_WRITE` | `false`                       | Permit `POST /hotboard/refresh` and the `/hotboard/*` writes.                                                                                           |
+| `API_ALLOW_SCHEDULE_WRITE` | `false`                       | Permit `PUT` and `PATCH /schedule`.                                                                                                                     |
+| `API_ALLOW_ENV_OVERRIDES`  | `false`                       | Permit arbitrary `env` fields in `/start` and `/restart`.                                                                                               |
+| `API_ALLOW_CONFIG_REVEAL`  | `false`                       | Permit authenticated `GET /config?reveal=1`.                                                                                                            |
+| `API_VALIDATOR_MODULE`     | auto                          | Path to a compiled module exporting `validateConfig` or `ConfigSchema`.                                                                                 |
+| `SCHEDULE_FILE`            | `<repo>/config/schedule.json` | Override the persisted schedule file path.                                                                                                              |
+| `CRON_SCHEDULE`            | unset                         | Base schedule reported and used when no persisted schedule override exists.                                                                             |
+| `HOTBOARD_FILE`            | `<repo>/config/hotboard.json` | Override the persisted hot board configuration file path.                                                                                               |
+| `HOTBOARD_CRON`            | `0 6 * * *`                   | Default hot board refresh cron while no `hotboard.json` exists.                                                                                         |
+| `HOTBOARD_SOURCES`         | `uapis.cn` hot board endpoint | Comma-separated default provider URLs (full request paths) while no `hotboard.json` exists. Default `https://uapis.cn/api/v1/misc/hotboard?type=baidu`. |
+| `HOTBOARD_SOURCE`          | —                             | Legacy alias: a single default provider URL, used only when `HOTBOARD_SOURCES` is unset.                                                                |
+| `HOTBOARD_LIMIT`           | `0`                           | Default number of titles kept per refresh, `0` for every title.                                                                                         |
+| `TZ`                       | `UTC`                         | Timezone used by cron and returned by `/schedule` and `/hotboard`.                                                                                      |
 
 The Docker entrypoint also uses `API_MODE=true` to run this API as the main
 container process. In that mode, scheduled and `RUN_ON_START` executions are
@@ -2466,18 +2541,18 @@ starting a second unusable instance.
 
 ## File layout
 
-| File                | Responsibility                                                                          |
-| ------------------- | --------------------------------------------------------------------------------------- |
-| `server.js`         | HTTP routing, authentication, CORS, SSE, diagnostics, config, and schedule endpoints.   |
-| `processManager.js` | Child-process lifecycle, process-tree termination, log buffering, and status events.    |
-| `logParser.js`      | Structured log parsing and live run/point accumulation.                                 |
-| `accounts.js`       | Safe account summaries and child-only account selection/remapping.                      |
-| `configEditor.js`   | Config loading, validation, deep merge, backup, and atomic replacement.                 |
-| `scheduleStore.js`  | Schedule validation, persistence, reads, and live crontab application.                  |
-| `hotboardStore.js`  | Hot board configuration, provider fetch, cron evaluation, and the in-process scheduler. |
-| `hotboard-api.md`   | Code-generation reference for the `/hotboard` endpoints.                                |
-| `sessionStore.js`   | Safe session metadata reads and account-specific SQLite session deletion.               |
-| `apply-schedule.js` | Restores a persisted schedule override during Docker startup.                           |
-| `trigger.js`        | Routes Docker cron and `RUN_ON_START` executions through the local API.                 |
-| `runCommand.js`     | Cross-platform resolution of the command used to launch the bot.                        |
-| `lib.js`            | Environment, project-root, logging, config-redaction, and argument helpers.             |
+| File                    | Responsibility                                                                                         |
+| ----------------------- | ------------------------------------------------------------------------------------------------------ |
+| `server.js`             | HTTP routing, authentication, CORS, SSE, diagnostics, config, and schedule endpoints.                  |
+| `processManager.js`     | Child-process lifecycle, process-tree termination, log buffering, and status events.                   |
+| `logParser.js`          | Structured log parsing and live run/point accumulation.                                                |
+| `accounts.js`           | Safe account summaries and child-only account selection/remapping.                                     |
+| `configEditor.js`       | Config loading, validation, deep merge, backup, and atomic replacement.                                |
+| `scheduleStore.js`      | Schedule validation, persistence, reads, and live crontab application.                                 |
+| `hotboardStore.js`      | Hot board configuration (multi-source), provider fetch, cron evaluation, and the in-process scheduler. |
+| `hotboardStore.test.js` | Unit tests for configuration, validation, aggregation, fetching, and state persistence.                |
+| `sessionStore.js`       | Safe session metadata reads and account-specific SQLite session deletion.                              |
+| `apply-schedule.js`     | Restores a persisted schedule override during Docker startup.                                          |
+| `trigger.js`            | Routes Docker cron and `RUN_ON_START` executions through the local API.                                |
+| `runCommand.js`         | Cross-platform resolution of the command used to launch the bot.                                       |
+| `lib.js`                | Environment, project-root, logging, config-redaction, and argument helpers.                            |

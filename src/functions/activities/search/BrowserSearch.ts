@@ -12,7 +12,15 @@ import type { MicrosoftRewardsBot } from '../../../index'
 
 const REFRESH_EVERY = 10
 const MAX_QUERY_ATTEMPTS = 5
-const SEARCH_ATTEMPT_TIMEOUT_MS = 120000
+// A single search attempt normally takes ~40-70s (typing + navigation + the
+// configured searchDelay of up to 1min). 90s leaves headroom for a slow Bing
+// response while failing a frozen tab fast instead of burning 5 x 120s per query.
+const SEARCH_ATTEMPT_TIMEOUT_MS = 90000
+// Cap on waiting for the results navigation after pressing Enter; a renderer
+// that hangs (common on low-memory boxes) is detected here instead of idling
+// until the whole attempt timeout.
+const SEARCH_NAVIGATION_TIMEOUT_MS = 30000
+const SEARCH_PAGE_RECOVERY_TIMEOUT_MS = 15000
 
 const POINTS_MAX_SEARCHES = 100
 const POINTS_STAGNANT_LIMIT = 10
@@ -175,6 +183,16 @@ export class Search extends BaseActivity {
                 )
                 if (attempt === MAX_QUERY_ATTEMPTS) throw error
                 await this.bot.utils.wait(2000)
+                // Recover before retrying: a timed-out attempt usually leaves the
+                // tab frozen (renderer hang on a low-memory box) or mid-navigation,
+                // so retrying on the same page fails again. Reload the search home
+                // so the next attempt starts from a clean tab. Recovery is best
+                // effort - a failure here must not abort the whole search session.
+                await page.goto(URLs.bing.origin).catch(() => {})
+                await page
+                    .waitForLoadState('domcontentloaded', { timeout: SEARCH_PAGE_RECOVERY_TIMEOUT_MS })
+                    .catch(() => {})
+                await this.bot.browser.utils.tryDismissAllMessages(page).catch(() => {})
             }
         }
     }
@@ -192,6 +210,13 @@ export class Search extends BaseActivity {
 
         await page.keyboard.type(query, { delay: this.bot.utils.randomDelay(45, 90) })
         await page.keyboard.press('Enter')
+
+        // Detect a hung navigation early. This resolves immediately when the page
+        // is already at domcontentloaded (Bing often routes client-side), and
+        // throws when a real navigation stalls - which fails the attempt fast so
+        // the retry loop can reload the page instead of idling until the full
+        // attempt timeout.
+        await page.waitForLoadState('domcontentloaded', { timeout: SEARCH_NAVIGATION_TIMEOUT_MS })
         await this.bot.utils.wait(3000)
 
         if (this.bot.config.searchSettings.scrollRandomResults) {

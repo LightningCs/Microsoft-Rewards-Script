@@ -5,7 +5,6 @@ import path from 'node:path'
 import test from 'node:test'
 
 import {
-    SUPPORTED_TYPES,
     cronMatches,
     fetchHotboard,
     getHotboardStatus,
@@ -106,8 +105,7 @@ test('falls back to environment defaults when no configuration file exists', () 
 
     assert.equal(config.enabled, true)
     assert.equal(config.cron, '0 6 * * *')
-    assert.deepEqual(config.sources, ['https://uapis.cn/api/v1/misc/hotboard'])
-    assert.equal(config.type, 'baidu')
+    assert.deepEqual(config.sources, ['https://uapis.cn/api/v1/misc/hotboard?type=baidu'])
     assert.equal(config.limit, 0)
     assert.equal(config.origin, 'env')
     assert.equal(config.path, configFile)
@@ -134,18 +132,16 @@ test('defaults split comma-separated HOTBOARD_SOURCES from the environment', () 
 test('persists configuration changes and validates every field', () => {
     const { root, configFile } = createProject()
 
-    const updated = writeHotboardConfig(root, { cron: '30 7 * * *', type: 'weibo', limit: 20 })
+    const updated = writeHotboardConfig(root, { cron: '30 7 * * *', limit: 20 })
 
     assert.equal(updated.enabled, true)
     assert.equal(updated.cron, '30 7 * * *')
-    assert.equal(updated.type, 'weibo')
     assert.equal(updated.limit, 20)
     assert.equal(updated.origin, 'override')
     assert.ok(updated.updatedAt)
 
     const saved = readJson(configFile)
     assert.equal(saved.cron, '30 7 * * *')
-    assert.equal(saved.type, 'weibo')
     assert.equal(saved.limit, 20)
     assert.equal(readHotboardConfig(root).origin, 'override')
 
@@ -163,10 +159,6 @@ test('persists configuration changes and validates every field', () => {
     )
     assert.throws(
         () => writeHotboardConfig(root, { sources: 'not-an-array' }),
-        err => err.code === 'BAD_REQUEST'
-    )
-    assert.throws(
-        () => writeHotboardConfig(root, { type: '' }),
         err => err.code === 'BAD_REQUEST'
     )
     assert.throws(
@@ -225,7 +217,7 @@ test('reports a corrupt configuration file instead of crashing', () => {
 })
 
 test('fetchHotboard extracts, normalizes, dedupes and truncates titles', async () => {
-    const config = { sources: ['https://uapis.cn/api/v1/misc/hotboard'], type: 'baidu', limit: 2 }
+    const config = { sources: ['https://uapis.cn/api/v1/misc/hotboard?type=baidu'], limit: 2 }
     const body = payload(['  第一条  热搜 ', '第二条热搜', '第一条 热搜', 42, '第三条热搜'])
 
     const result = await withFetch(jsonFetch(body), () => fetchHotboard(config))
@@ -234,13 +226,36 @@ test('fetchHotboard extracts, normalizes, dedupes and truncates titles', async (
     assert.equal(result.httpStatus, 200)
     assert.equal(result.upstreamUpdateTime, '2026-10-19T01:58:00.000Z')
     assert.deepEqual(result.titles, ['第一条 热搜', '第二条热搜'])
-    assert.equal(result.usedSource, 'https://uapis.cn/api/v1/misc/hotboard')
+    assert.equal(result.usedSource, 'https://uapis.cn/api/v1/misc/hotboard?type=baidu')
     assert.deepEqual(result.failedSources, [])
     assert.equal(result.attempts.length, 1)
 })
 
+test('fetchHotboard tolerates different response shapes (containers and title keys)', async () => {
+    const config = { sources: ['https://provider.example/api'], limit: 0 }
+
+    const dataList = await withFetch(
+        jsonFetch({ update_time: '2026-10-19T01:00:00.000Z', data: [{ title: '甲' }, { title: '乙' }] }),
+        () => fetchHotboard(config)
+    )
+    assert.deepEqual(dataList.titles, ['甲', '乙'])
+
+    const nestedItems = await withFetch(jsonFetch({ data: { items: [{ word: '丙' }, { word: '丁' }] } }), () =>
+        fetchHotboard(config)
+    )
+    assert.deepEqual(nestedItems.titles, ['丙', '丁'])
+
+    const nameList = await withFetch(jsonFetch({ result: [{ name: '戊' }, { name: '己' }] }), () =>
+        fetchHotboard(config)
+    )
+    assert.deepEqual(nameList.titles, ['戊', '己'])
+
+    const stringArray = await withFetch(jsonFetch(['庚', '辛']), () => fetchHotboard(config))
+    assert.deepEqual(stringArray.titles, ['庚', '辛'])
+})
+
 test('fetchHotboard surfaces upstream errors and malformed payloads', async () => {
-    const config = { sources: ['https://uapis.cn/api/v1/misc/hotboard'], type: 'nope', limit: 0 }
+    const config = { sources: ['https://uapis.cn/api/v1/misc/hotboard?type=nope'], limit: 0 }
 
     const upstreamError = await withFetch(jsonFetch({ code: 400, message: 'type is invalid' }, 400), () =>
         fetchHotboard(config)
@@ -251,7 +266,7 @@ test('fetchHotboard surfaces upstream errors and malformed payloads', async () =
 
     const noList = await withFetch(jsonFetch({ type: 'baidu' }), () => fetchHotboard(config))
     assert.equal(noList.ok, false)
-    assert.match(noList.error, /no `list` array/)
+    assert.match(noList.error, /no array of items/)
 
     const notJson = await withFetch(
         async () => ({ ok: true, status: 200, text: async () => '<html>' }),
@@ -271,36 +286,50 @@ test('fetchHotboard surfaces upstream errors and malformed payloads', async () =
     assert.match(rejected.error, /ENOTFOUND/)
 })
 
-test('fetchHotboard round-robins sources and falls back on failure', async () => {
-    const good = 'https://good.example/hotboard'
+test('fetchHotboard aggregates titles from every source, deduping in source order', async () => {
+    const one = 'https://one.example/hotboard'
     const bad = 'https://bad.example/hotboard'
-    const config = { sources: [bad, good], type: 'baidu', limit: 0 }
+    const two = 'https://two.example/hotboard'
+    const config = { sources: [one, bad, two], limit: 0 }
     const calls = []
     const stub = async url => {
         calls.push(url)
-        if (url.includes('bad.example')) return { ok: false, status: 500, text: async () => 'boom' }
-        return jsonFetch(payload(['from good source']))(url)
+        if (url === bad) return { ok: false, status: 500, text: async () => 'boom' }
+        if (url === one) return jsonFetch(payload(['A', 'B', 'A']))(url)
+        return jsonFetch(payload(['B', 'C']))(url)
     }
 
-    const first = await withFetch(stub, () => fetchHotboard(config))
-    assert.equal(first.ok, true)
-    assert.equal(first.usedSource, good)
-    assert.deepEqual(first.failedSources, [bad])
-    assert.equal(first.attempts.length, 2)
-    assert.equal(first.attempts[0].url, bad)
-    assert.equal(first.attempts[1].url, good)
-    assert.deepEqual(first.titles, ['from good source'])
-    assert.deepEqual(calls, [`${bad}?type=baidu`, `${good}?type=baidu`])
+    const result = await withFetch(stub, () => fetchHotboard(config))
 
-    // rotation pointer advanced: the next refresh starts at `good` and succeeds immediately
-    const second = await withFetch(stub, () => fetchHotboard(config))
-    assert.equal(second.ok, true)
-    assert.equal(second.usedSource, good)
-    assert.deepEqual(calls.slice(2), [`${good}?type=baidu`])
+    assert.equal(result.ok, true)
+    // every source is requested, not stopped at the first success
+    assert.deepEqual(calls, [one, bad, two])
+    // merged, deduped, source order preserved; the failed source is skipped
+    assert.deepEqual(result.titles, ['A', 'B', 'C'])
+    assert.deepEqual(result.usedSources, [one, two])
+    assert.equal(result.usedSource, one)
+    assert.deepEqual(result.failedSources, [bad])
+    assert.equal(result.attempts.length, 3)
+})
+
+test('fetchHotboard caps the merged list with the global limit', async () => {
+    const config = { sources: ['https://one.example/hotboard', 'https://two.example/hotboard'], limit: 3 }
+
+    const result = await withFetch(
+        async url => {
+            if (url.includes('one.')) return jsonFetch(payload(['a', 'b']))(url)
+            return jsonFetch(payload(['c', 'd', 'e']))(url)
+        },
+        () => fetchHotboard(config)
+    )
+
+    assert.equal(result.ok, true)
+    assert.deepEqual(result.titles, ['a', 'b', 'c'])
+    assert.deepEqual(result.usedSources, ['https://one.example/hotboard', 'https://two.example/hotboard'])
 })
 
 test('fetchHotboard reports every failed source when all sources fail', async () => {
-    const config = { sources: ['https://a.example/hotboard', 'https://b.example/hotboard'], type: 'baidu', limit: 0 }
+    const config = { sources: ['https://a.example/hotboard', 'https://b.example/hotboard'], limit: 0 }
 
     const result = await withFetch(
         async () => ({ ok: false, status: 503, text: async () => 'down' }),
@@ -309,6 +338,7 @@ test('fetchHotboard reports every failed source when all sources fail', async ()
 
     assert.equal(result.ok, false)
     assert.equal(result.usedSource, null)
+    assert.deepEqual(result.usedSources, [])
     assert.deepEqual(result.failedSources, ['https://a.example/hotboard', 'https://b.example/hotboard'])
     assert.equal(result.attempts.length, 2)
     assert.match(result.error, /Upstream responded 503/)
@@ -375,7 +405,7 @@ test('a dry run reads the upstream without touching the list or the state file',
     assert.equal(fs.existsSync(configFile), false)
 })
 
-test('getHotboardStatus exposes schedule, source, query file and supported types', () => {
+test('getHotboardStatus exposes schedule, sources, query file and limits', () => {
     const { root } = createProject({ queries: ['a', 'b'] })
 
     const status = getHotboardStatus(root)
@@ -383,8 +413,7 @@ test('getHotboardStatus exposes schedule, source, query file and supported types
     assert.equal(status.enabled, true)
     assert.equal(status.origin, 'env')
     assert.equal(typeof status.nextRunAt, 'string')
-    assert.deepEqual(status.sources, ['https://uapis.cn/api/v1/misc/hotboard'])
+    assert.deepEqual(status.sources, ['https://uapis.cn/api/v1/misc/hotboard?type=baidu'])
     assert.equal(status.queryFile.count, 2)
-    assert.deepEqual(status.supportedTypes, SUPPORTED_TYPES)
     assert.equal(status.limits.maxLimit, 500)
 })
